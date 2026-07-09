@@ -8,6 +8,10 @@ This PyTorch implementation is loosely based on [Edward Hu](https://github.com/e
 
 ----
 
+**[June 2026] Our [Hallucination in World Models is Predictable and Preventable](https://github.com/nicklashansen/mmbench2) code repository is now available. It is a strictly better implementation of Dreamer 4: improved training recipe, larger dataset, and bigger model. Check it out!**
+
+----
+
 ![Demo](assets/0.gif)
 
 **Try it out!** We provide model checkpoints and a simple web interface for interaction with the world model.
