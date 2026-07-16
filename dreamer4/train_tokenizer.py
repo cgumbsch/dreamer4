@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader, DistributedSampler
 
 import wandb
@@ -19,6 +19,7 @@ from model import (
     Encoder, Decoder, Tokenizer,
     temporal_patchify, temporal_unpatchify,
     recon_loss_from_mae, lpips_on_mae_recon,
+    EmaRms,
 )
 
 try:
@@ -125,29 +126,32 @@ def log_tokenizer_viz_wandb(
     )
 
 
-def save_ckpt(path: Path, *, step: int, epoch: int, model, opt, scaler, args: argparse.Namespace):
+def save_ckpt(path: Path, *, step: int, epoch: int, model, opt, args: argparse.Namespace, rms=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     obj = {
         "step": step,
         "epoch": epoch,
         "model": (model.module.state_dict() if hasattr(model, "module") else model.state_dict()),
         "opt": opt.state_dict(),
-        "scaler": scaler.state_dict() if scaler is not None else None,
         "args": vars(args),
         "scale_pos_embeds": args.scale_pos_embeds,
     }
+    if rms is not None:
+        obj["rms"] = {k: v.state_dict() for k, v in rms.items()}
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
     tmp.replace(path)
 
 
-def load_ckpt(path: Path, *, model, opt, scaler) -> tuple[int, int]:
+def load_ckpt(path: Path, *, model, opt, rms=None) -> tuple[int, int]:
     ckpt = torch.load(path, map_location="cpu")
     state = ckpt["model"]
     (model.module if hasattr(model, "module") else model).load_state_dict(state, strict=True)
     opt.load_state_dict(ckpt["opt"])
-    if scaler is not None and ckpt.get("scaler") is not None:
-        scaler.load_state_dict(ckpt["scaler"])
+    if rms is not None and ckpt.get("rms") is not None:
+        for k, v in rms.items():
+            if k in ckpt["rms"]:
+                v.load_state_dict(ckpt["rms"][k])
     return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
 
 
@@ -232,7 +236,10 @@ def train(args):
     # ---- optim ----
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     use_amp = torch.cuda.is_available()
-    scaler = GradScaler(device="cuda", enabled=use_amp)
+
+    rms_mse = EmaRms().to(device)
+    rms_lp = EmaRms().to(device)
+    rms = {"mse": rms_mse, "lp": rms_lp}
 
     # ---- lpips ----
     if args.lpips_weight > 0.0:
@@ -258,7 +265,7 @@ def train(args):
     start_epoch = 0
     ckpt_dir = Path(args.ckpt_dir)
     if args.resume is not None:
-        step, start_epoch = load_ckpt(Path(args.resume), model=model, opt=opt, scaler=scaler)
+        step, start_epoch = load_ckpt(Path(args.resume), model=model, opt=opt, rms=rms)
         if is_rank0():
             print(f"[rank0] Resumed from {args.resume} (step={step}, epoch={start_epoch})")
 
@@ -283,13 +290,26 @@ def train(args):
                 with torch.no_grad():
                     if is_rank0() and step % args.log_every == 0:
                         z, _ = (model.module.encoder if hasattr(model, "module") else model.encoder)(patches)
-                        wandb.log({"debug/z_std": float(z.float().std().item())}, step=step)
+                        zf = z.float()
+                        z_spread = float(zf.flatten(1).std(dim=0).mean().item())
+                        wandb.log({
+                            "debug/z_std": float(zf.std().item()),
+                            "debug/z_mean": float(zf.mean().item()),
+                            "debug/z_abs_max": float(zf.abs().max().item()),
+                            "debug/z_spread": z_spread,
+                        }, step=step)
+                        if step >= args.collapse_check_after and z_spread < args.collapse_spread_min:
+                            raise RuntimeError(
+                                f"Bottleneck collapse: between-sample z_spread={z_spread:.2e} "
+                                f"< {args.collapse_spread_min} at step {step}"
+                            )
 
-                with autocast(device_type="cuda", enabled=use_amp):
+                with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                     pred, mae_mask, keep_prob = model(patches)
 
                 # losses in fp32 (outside autocast)
                 mse = recon_loss_from_mae(pred, patches, mae_mask)
+                rms_mse.update(mse)
 
                 if lpips_fn is not None and args.lpips_weight > 0.0:
                     lp = lpips_on_mae_recon(
@@ -297,34 +317,44 @@ def train(args):
                         H=args.H, W=args.W, C=args.C, patch=args.patch,
                         subsample_frac=args.lpips_frac
                     )
-                    loss = mse + args.lpips_weight * lp
+                    rms_lp.update(lp)
+                    loss = rms_mse.normalize(mse) + args.lpips_weight * rms_lp.normalize(lp)
                 else:
                     lp = torch.zeros((), device=device)
-                    loss = mse
+                    loss = rms_mse.normalize(mse)
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Non-finite loss at step {step}: loss={loss} mse={mse} lp={lp}")
 
                 loss_to_backprop = loss / grad_accum
 
-                scaler.scale(loss_to_backprop).backward()
+                loss_to_backprop.backward()
 
                 do_step = ((step + 1) % grad_accum == 0)
+                grad_norm_enc = grad_norm_dec = 0.0
                 if do_step:
-                    if use_amp:
-                        scaler.step(opt)
+                    _model = model.module if hasattr(model, "module") else model
+                    clip_enc = args.grad_clip_enc if args.grad_clip_enc > 0 else float("inf")
+                    clip_dec = args.grad_clip_dec if args.grad_clip_dec > 0 else float("inf")
+                    grad_norm_enc = float(torch.nn.utils.clip_grad_norm_(
+                        _model.encoder.parameters(), max_norm=clip_enc).item())
+                    grad_norm_dec = float(torch.nn.utils.clip_grad_norm_(
+                        _model.decoder.parameters(), max_norm=clip_dec).item())
 
-                        if is_rank0() and step % args.log_every == 0:
-                            wandb.log({"amp/scale": float(scaler.get_scale())}, step=step)
+                    if args.warmup_steps > 0 and step < args.warmup_steps:
+                        warmup_frac = (step + 1) / args.warmup_steps
+                        for pg in opt.param_groups:
+                            pg["lr"] = args.lr * warmup_frac
 
-                        scaler.update()
-                    else:
-                        opt.step()
+                    opt.step()
                     opt.zero_grad(set_to_none=True)
 
                 # ---- logging ----
                 if is_rank0() and (step % args.log_every == 0):
                     psnr = 10.0 * torch.log10(1.0 / mse.clamp_min(1e-10))
+                    _model = model.module if hasattr(model, "module") else model
+                    weight_norm_enc = float(sum(p.float().norm().item() ** 2 for p in _model.encoder.parameters()) ** 0.5)
+                    weight_norm_dec = float(sum(p.float().norm().item() ** 2 for p in _model.decoder.parameters()) ** 0.5)
                     wandb.log(
                         {
                             "loss/total": float(loss.item()),
@@ -333,6 +363,12 @@ def train(args):
                             "stats/psnr": float(psnr.item()),
                             "stats/keep_prob": float(keep_prob.mean().item()),
                             "stats/masked_frac": float(mae_mask.float().mean().item()),
+                            "stats/grad_norm_enc": grad_norm_enc,
+                            "stats/grad_norm_dec": grad_norm_dec,
+                            "stats/weight_norm_enc": weight_norm_enc,
+                            "stats/weight_norm_dec": weight_norm_dec,
+                            "rms/mse": rms_mse.rms_val,
+                            "rms/lp": rms_lp.rms_val,
                             "lr": float(opt.param_groups[0]["lr"]),
                             "time/hrs": (time.time() - t0) / 3600.0,
                         },
@@ -360,12 +396,13 @@ def train(args):
                     )
 
                 # ---- ckpt ----
-                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
+                # save on optimizer boundaries (compatible with grad_accum > 1)
+                if is_rank0() and args.save_every > 0 and do_step and (step % args.save_every) < grad_accum:
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
-                    save_ckpt(ckpt_path, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
+                    save_ckpt(ckpt_path, step=step, epoch=epoch, model=model, opt=opt, args=args, rms=rms)
                     # also update a "latest" pointer
                     latest = ckpt_dir / "latest.pt"
-                    save_ckpt(latest, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
+                    save_ckpt(latest, step=step, epoch=epoch, model=model, opt=opt, args=args, rms=rms)
 
                 step += 1
 
@@ -382,8 +419,8 @@ def train(args):
     # fires only on step % save_every == 0 and never lands on max_steps).
     if is_rank0():
         final_ckpt = ckpt_dir / f"step_{step:07d}.pt"
-        save_ckpt(final_ckpt, step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
-        save_ckpt(ckpt_dir / "latest.pt", step=step, epoch=epoch, model=model, opt=opt, scaler=scaler, args=args)
+        save_ckpt(final_ckpt, step=step, epoch=epoch, model=model, opt=opt, args=args, rms=rms)
+        save_ckpt(ckpt_dir / "latest.pt", step=step, epoch=epoch, model=model, opt=opt, args=args, rms=rms)
 
     if ddp:
         dist.barrier()
@@ -430,6 +467,13 @@ if __name__ == "__main__":
     p.add_argument("--weight_decay", type=float, default=1e-2)
     p.add_argument("--max_steps", type=int, default=10_000_000)
     p.add_argument("--grad_accum", type=int, default=1)
+    p.add_argument("--grad_clip_enc", type=float, default=1.0)
+    p.add_argument("--grad_clip_dec", type=float, default=1.0)
+    p.add_argument("--warmup_steps", type=int, default=0)
+
+    # collapse tripwire (debug/z_spread is logged every log_every steps)
+    p.add_argument("--collapse_check_after", type=int, default=1000)
+    p.add_argument("--collapse_spread_min", type=float, default=1e-3)
 
     # lpips
     p.add_argument("--lpips_weight", type=float, default=0.2)

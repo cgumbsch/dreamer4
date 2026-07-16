@@ -102,6 +102,31 @@ def add_sinusoidal_positions(tokens_btSd: torch.Tensor, scale_pos_embeds) -> tor
     return tokens_btSd + pos.to(dtype=tokens_btSd.dtype)
 
 
+class EmaRms(nn.Module):
+    """
+    Running root-mean-square normalizer using exponential moving average (EMA).
+    Per the Dreamer 4 paper: "we normalize all loss terms by running estimates
+    of their root-mean-square (RMS)." This makes loss coefficients interpretable
+    as relative weights regardless of each term's absolute scale.
+    """
+    def __init__(self, decay: float = 0.99):
+        super().__init__()
+        self.decay = float(decay)
+        self.register_buffer("sq_ema", torch.tensor(1.0))
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> None:
+        v = float(x.detach().float().item())
+        self.sq_ema.mul_(self.decay).add_((1.0 - self.decay) * v * v)
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x / self.sq_ema.sqrt().clamp_min(1e-8)
+
+    @property
+    def rms_val(self) -> float:
+        return float(self.sq_ema.sqrt().item())
+
+
 class MAEReplacer(nn.Module):
     def __init__(self, d_model: int, p_min: float = 0.0, p_max: float = 0.9):
         super().__init__()
