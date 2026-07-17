@@ -191,16 +191,21 @@ class MLP(nn.Module):
 
 
 class MultiheadSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0,
+                 qk_norm: bool = False, attn_softcap: float = 0.0):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.dropout_p = float(dropout)
+        self.attn_softcap = float(attn_softcap)
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=True)
         self.out = nn.Linear(d_model, d_model, bias=True)
+        # optional per-head q/k RMS normalization; no params created when disabled
+        self.q_norm = RMSNorm(self.head_dim) if qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
 
     def forward(self, x_nld: torch.Tensor, *, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False):
         """
@@ -214,14 +219,33 @@ class MultiheadSelfAttention(nn.Module):
         k = k.view(N, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(N, L, self.n_heads, self.head_dim).transpose(1, 2)
 
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
         drop = self.dropout_p if self.training else 0.0
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop, is_causal=is_causal)
+        if self.attn_softcap > 0.0:
+            # soft capping needs explicit logits -> manual attention path
+            logits = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+            logits = torch.tanh(logits / self.attn_softcap) * self.attn_softcap
+            if is_causal:
+                causal = torch.ones(L, L, dtype=torch.bool, device=x_nld.device).tril()
+                logits = logits.masked_fill(~causal, float("-inf"))
+            if attn_mask is not None:
+                logits = logits.masked_fill(~attn_mask, float("-inf"))
+            attn = torch.softmax(logits, dim=-1)
+            if drop > 0.0:
+                attn = F.dropout(attn, p=drop)
+            y = torch.matmul(attn, v)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop, is_causal=is_causal)
         y = y.transpose(1, 2).contiguous().view(N, L, D)
         return self.out(y)
 
 
 class SpaceSelfAttentionModality(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, modality_ids: torch.Tensor, n_latents: int, mode: str, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, modality_ids: torch.Tensor, n_latents: int, mode: str, dropout: float,
+                 qk_norm: bool = False, attn_softcap: float = 0.0):
         super().__init__()
         self.n_latents = int(n_latents)
         self.mode = mode
@@ -232,7 +256,8 @@ class SpaceSelfAttentionModality(nn.Module):
         attn_mask = allow.unsqueeze(0).unsqueeze(0)                # (1,1,S,S) True=allowed (PyTorch SDPA bool mask)
         self.register_buffer("attn_mask", attn_mask, persistent=False)
 
-        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout)
+        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout,
+                                           qk_norm=qk_norm, attn_softcap=attn_softcap)
 
     def _build_allow(self, S: int) -> torch.Tensor:
         device = self.modality_ids.device
@@ -287,11 +312,13 @@ class SpaceSelfAttentionModality(nn.Module):
 
 
 class TimeSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float, latents_only: bool, n_latents: int):
+    def __init__(self, d_model: int, n_heads: int, dropout: float, latents_only: bool, n_latents: int,
+                 qk_norm: bool = False, attn_softcap: float = 0.0):
         super().__init__()
         self.latents_only = bool(latents_only)
         self.n_latents = int(n_latents)
-        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout)
+        self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout,
+                                           qk_norm=qk_norm, attn_softcap=attn_softcap)
 
     def forward(self, x_btSd: torch.Tensor) -> torch.Tensor:
         B, T, S, D = x_btSd.shape
@@ -323,17 +350,21 @@ class BlockCausalLayer(nn.Module):
         layer_index: int,
         time_every: int,
         latents_only_time: bool,
+        qk_norm: bool = False,
+        attn_softcap: float = 0.0,
     ):
         super().__init__()
         self.do_time = ((layer_index + 1) % time_every == 0)
 
         self.norm1 = RMSNorm(d_model)
-        self.space = SpaceSelfAttentionModality(d_model, n_heads, modality_ids, n_latents, space_mode, dropout)
+        self.space = SpaceSelfAttentionModality(d_model, n_heads, modality_ids, n_latents, space_mode, dropout,
+                                                qk_norm=qk_norm, attn_softcap=attn_softcap)
         self.drop1 = nn.Dropout(dropout)
 
         if self.do_time:
             self.norm2 = RMSNorm(d_model)
-            self.time = TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents)
+            self.time = TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents,
+                                          qk_norm=qk_norm, attn_softcap=attn_softcap)
             self.drop2 = nn.Dropout(dropout)
 
         self.norm3 = RMSNorm(d_model)
@@ -360,6 +391,8 @@ class BlockCausalTransformer(nn.Module):
         mlp_ratio: float,
         time_every: int,
         latents_only_time: bool,
+        qk_norm: bool = False,
+        attn_softcap: float = 0.0,
     ):
         super().__init__()
         self.layers = nn.ModuleList([
@@ -369,6 +402,7 @@ class BlockCausalTransformer(nn.Module):
                 dropout=dropout, mlp_ratio=mlp_ratio,
                 layer_index=i, time_every=time_every,
                 latents_only_time=latents_only_time,
+                qk_norm=qk_norm, attn_softcap=attn_softcap,
             )
             for i in range(depth)
         ])
@@ -397,6 +431,8 @@ class Encoder(nn.Module):
         mae_p_min: float = 0.0,
         mae_p_max: float = 0.9,
         scale_pos_embeds: bool = True,
+        qk_norm: bool = False,
+        attn_softcap: float = 0.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -416,6 +452,7 @@ class Encoder(nn.Module):
             space_mode="encoder",
             dropout=dropout, mlp_ratio=mlp_ratio,
             time_every=time_every, latents_only_time=latents_only_time,
+            qk_norm=qk_norm, attn_softcap=attn_softcap,
         )
         self.mae = MAEReplacer(d_model=d_model, p_min=mae_p_min, p_max=mae_p_max)
 
@@ -454,6 +491,8 @@ class Decoder(nn.Module):
         time_every: int = 4,
         latents_only_time: bool = True,
         scale_pos_embeds: bool = True,
+        qk_norm: bool = False,
+        attn_softcap: float = 0.0,
     ):
         super().__init__()
         self.n_latents = n_latents
@@ -475,6 +514,7 @@ class Decoder(nn.Module):
             space_mode="decoder",
             dropout=dropout, mlp_ratio=mlp_ratio,
             time_every=time_every, latents_only_time=latents_only_time,
+            qk_norm=qk_norm, attn_softcap=attn_softcap,
         )
 
     def forward(self, z_btLd: torch.Tensor) -> torch.Tensor:

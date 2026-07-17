@@ -204,6 +204,8 @@ def train(args):
         mae_p_min=args.mae_p_min,
         mae_p_max=args.mae_p_max,
         scale_pos_embeds=args.scale_pos_embeds,
+        qk_norm=args.qk_norm,
+        attn_softcap=args.attn_softcap,
     )
     dec = Decoder(
         d_bottleneck=args.d_bottleneck,
@@ -217,6 +219,8 @@ def train(args):
         mlp_ratio=args.mlp_ratio,
         time_every=args.time_every,
         scale_pos_embeds=args.scale_pos_embeds,
+        qk_norm=args.qk_norm,
+        attn_softcap=args.attn_softcap,
     )
     model = Tokenizer(enc, dec).to(device)
 
@@ -457,6 +461,8 @@ if __name__ == "__main__":
     p.add_argument("--time_every", type=int, default=1)
     p.add_argument("--mae_p_min", type=float, default=0.0)
     p.add_argument("--mae_p_max", type=float, default=0.9)
+    p.add_argument("--qk_norm", action="store_true")
+    p.add_argument("--attn_softcap", type=float, default=0.0)
 
     # Better performance without scale_pos_embeds (set to False)
     # Set to True by default for backwards compatibility. Details here: https://github.com/nicklashansen/dreamer4/pull/4
