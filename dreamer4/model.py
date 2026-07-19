@@ -657,6 +657,8 @@ class Dynamics(nn.Module):
         time_every: int = 4,
         space_mode: str = "wm_agent_isolated",  # or "wm_agent"
         scale_pos_embeds: bool = True,
+        qk_norm: bool = False,
+        attn_softcap: float = 0.0,
     ):
         super().__init__()
         assert d_spatial % d_bottleneck == 0, "expected packing: d_spatial = d_bottleneck * packing_factor"
@@ -706,6 +708,8 @@ class Dynamics(nn.Module):
             mlp_ratio=float(mlp_ratio),
             time_every=int(time_every),
             latents_only_time=False,
+            qk_norm=qk_norm,
+            attn_softcap=attn_softcap,
         )
 
         self.flow_x_head = nn.Linear(self.d_model, self.d_spatial)

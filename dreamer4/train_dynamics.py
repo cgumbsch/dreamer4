@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast
 from torch.utils.data import DataLoader, DistributedSampler
 
 import wandb
@@ -20,6 +20,7 @@ from sharded_frame_dataset import ShardedFrameDataset
 
 from model import (
     Encoder, Decoder, Tokenizer,
+    EmaRms,
     temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial,
     unpack_spatial_to_bottleneck,
@@ -63,14 +64,14 @@ def init_distributed() -> tuple[bool, int, int, int]:
     return ddp, rank, world_size, local_rank
 
 
-def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, scaler, args: argparse.Namespace):
+def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, args: argparse.Namespace, rms=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     obj = {
         "step": step,
         "epoch": epoch,
         "dynamics": (dyn_model.module.state_dict() if hasattr(dyn_model, "module") else dyn_model.state_dict()),
         "opt": opt.state_dict(),
-        "scaler": scaler.state_dict() if scaler is not None else None,
+        "rms": {k: v.state_dict() for k, v in rms.items()} if rms is not None else None,
         "args": vars(args),
         "scale_pos_embeds": args.scale_pos_embeds,
     }
@@ -79,13 +80,15 @@ def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, scaler, args
     tmp.replace(path)
 
 
-def load_ckpt(path: Path, *, dyn_model, opt, scaler) -> tuple[int, int]:
+def load_ckpt(path: Path, *, dyn_model, opt, rms=None) -> tuple[int, int]:
     ckpt = torch.load(path, map_location="cpu")
     state = ckpt["dynamics"]
     (dyn_model.module if hasattr(dyn_model, "module") else dyn_model).load_state_dict(state, strict=True)
     opt.load_state_dict(ckpt["opt"])
-    if scaler is not None and ckpt.get("scaler") is not None:
-        scaler.load_state_dict(ckpt["scaler"])
+    if rms is not None and ckpt.get("rms") is not None:
+        for k, v in rms.items():
+            if k in ckpt["rms"]:
+                v.load_state_dict(ckpt["rms"][k])
     return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
 
 
@@ -187,6 +190,8 @@ def dynamics_pretrain_loss(
     step: int,
     bootstrap_start: int,
     agent_tokens: Optional[torch.Tensor] = None,
+    rms: Optional[Dict[str, EmaRms]] = None,
+    update_rms: bool = False,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     device = z1.device
     B, T = z1.shape[:2]
@@ -255,8 +260,30 @@ def dynamics_pretrain_loss(
         loss_self = (boot_per * w_self).mean()
         boot_mse = boot_per.mean()
 
+    # Normalize each loss term by its running RMS (paper: "we normalize all loss
+    # terms by running estimates of their root-mean-square"). The bootstrap RMS only
+    # tracks steps where the term is active, so pre-bootstrap zeros don't skew it.
+    if rms is not None:
+        if update_rms:
+            rms["flow"].update(loss_emp)
+            if do_boot:
+                rms["boot"].update(loss_self)
+        loss_emp_c = rms["flow"].normalize(loss_emp)
+        loss_self_c = rms["boot"].normalize(loss_self) if do_boot else loss_self
+    else:
+        loss_emp_c = loss_emp
+        loss_self_c = loss_self
+
     # Combine losses
-    loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
+    loss = ((loss_emp_c * (B - B_self)) + (loss_self_c * B_self)) / B
+
+    with torch.no_grad():
+        # Between-sample spread of the empirical-row predictions: the dynamics analog
+        # of the tokenizer's z_spread (collapse = input-independent prediction).
+        if B_emp >= 2:
+            pred_spread = z1_hat_emp.float().flatten(1).std(dim=0).mean()
+        else:
+            pred_spread = torch.zeros((), device=device)
 
     aux = {
         "flow_mse": flow_per.mean().detach(),
@@ -264,6 +291,7 @@ def dynamics_pretrain_loss(
         "loss_emp": loss_emp.detach(),
         "loss_self": loss_self.detach(),
         "sigma_mean": sigma_full.mean().detach(),
+        "pred_spread": pred_spread.detach(),
     }
     return loss, aux
 
@@ -666,6 +694,8 @@ def train(args):
         time_every=args.time_every,
         space_mode=args.space_mode,
         scale_pos_embeds=args.scale_pos_embeds,
+        qk_norm=args.qk_norm,
+        attn_softcap=args.attn_softcap,
     ).to(device)
 
     if is_rank0():
@@ -682,12 +712,13 @@ def train(args):
             dyn, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False
         )
 
-    # Optimizer and scaler
+    # Optimizer
     opt = torch.optim.AdamW(
         dyn.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999)
     )
     use_amp = torch.cuda.is_available()
-    scaler = GradScaler(device="cuda", enabled=use_amp)
+
+    rms = {"flow": EmaRms().to(device), "boot": EmaRms().to(device)}
 
     # Initialize wandb
     if is_rank0():
@@ -704,7 +735,7 @@ def train(args):
     start_epoch = 0
     ckpt_dir = Path(args.ckpt_dir)
     if args.resume is not None:
-        step, start_epoch = load_ckpt(Path(args.resume), dyn_model=dyn, opt=opt, scaler=scaler)
+        step, start_epoch = load_ckpt(Path(args.resume), dyn_model=dyn, opt=opt, rms=rms)
         if is_rank0():
             print(f"[rank0] Resumed from {args.resume} (step={step}, epoch={start_epoch})")
 
@@ -757,7 +788,7 @@ def train(args):
                 B_self = int(round(args.self_fraction * B))
                 B_self = max(0, min(B - 1, B_self))
 
-                with autocast(device_type="cuda", enabled=use_amp):
+                with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                     loss, aux = dynamics_pretrain_loss(
                         dyn.module if hasattr(dyn, "module") else dyn,
                         z1=z1,
@@ -768,28 +799,31 @@ def train(args):
                         step=step,
                         bootstrap_start=args.bootstrap_start,
                         agent_tokens=None,
+                        rms=rms,
+                        update_rms=True,
                     )
 
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Non-finite loss at step {step}: loss={loss}")
 
                 loss_to_backprop = loss / grad_accum
-                scaler.scale(loss_to_backprop).backward()
+                loss_to_backprop.backward()
 
                 do_step = ((step + 1) % grad_accum == 0)
+                grad_norm = 0.0
                 if do_step:
-                    if args.grad_clip > 0:
-                        scaler.unscale_(opt)
-                        torch.nn.utils.clip_grad_norm_(
-                            (dyn.module if hasattr(dyn, "module") else dyn).parameters(),
-                            max_norm=args.grad_clip,
-                        )
+                    clip = args.grad_clip if args.grad_clip > 0 else float("inf")
+                    grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                        (dyn.module if hasattr(dyn, "module") else dyn).parameters(),
+                        max_norm=clip,
+                    ).item())
 
-                    if use_amp:
-                        scaler.step(opt)
-                        scaler.update()
-                    else:
-                        opt.step()
+                    if args.warmup_steps > 0 and step < args.warmup_steps:
+                        warmup_frac = (step + 1) / args.warmup_steps
+                        for pg in opt.param_groups:
+                            pg["lr"] = args.lr * warmup_frac
+
+                    opt.step()
                     opt.zero_grad(set_to_none=True)
 
                 # Evaluation / visualization
@@ -841,6 +875,8 @@ def train(args):
                                 step=step,
                                 bootstrap_start=args.bootstrap_start,
                                 agent_tokens=None,
+                                rms=rms,
+                                update_rms=False,
                             )
                             perm = torch.randperm(actions.shape[0], device=actions.device)
                             loss_shuffled, _ = dynamics_pretrain_loss(
@@ -853,10 +889,18 @@ def train(args):
                                 step=step,
                                 bootstrap_start=args.bootstrap_start,
                                 agent_tokens=None,
+                                rms=rms,
+                                update_rms=False,
                             )
                         action_shuffle_loss_ratio = loss_shuffled / loss
                     else:
                         action_shuffle_loss_ratio = torch.tensor(0., device=device)
+
+                    pred_spread = float(aux["pred_spread"].item())
+                    weight_norm = float(sum(
+                        p.float().norm().item() ** 2
+                        for p in (dyn.module if hasattr(dyn, "module") else dyn).parameters()
+                    ) ** 0.5)
 
                     # Log to wandb
                     wandb.log(
@@ -869,11 +913,23 @@ def train(args):
                             "stats/action_shuffle_loss_ratio": float(action_shuffle_loss_ratio.item()),
                             "stats/sigma_mean": float(aux["sigma_mean"].item()),
                             "stats/B_self": float(B_self),
+                            "stats/grad_norm": grad_norm,
+                            "stats/weight_norm": weight_norm,
+                            "debug/pred_spread": pred_spread,
+                            "rms/flow": rms["flow"].rms_val,
+                            "rms/boot": rms["boot"].rms_val,
                             "lr": float(opt.param_groups[0]["lr"]),
                             "time/hrs": (time.time() - t0) / 3600.0,
                         },
                         step=step,
                     )
+
+                    # Collapse tripwire: predictions must stay input-dependent
+                    if step >= args.collapse_check_after and pred_spread < args.collapse_spread_min:
+                        raise RuntimeError(
+                            f"Dynamics collapse: between-sample pred_spread={pred_spread:.2e} "
+                            f"< {args.collapse_spread_min} at step {step}"
+                        )
 
                     # Log to console
                     print(
@@ -884,11 +940,12 @@ def train(args):
                     )
 
                 # Checkpointing
-                if is_rank0() and args.save_every > 0 and (step % args.save_every == 0) and do_step:
+                # save on optimizer boundaries (compatible with grad_accum > 1)
+                if is_rank0() and args.save_every > 0 and do_step and (step % args.save_every) < grad_accum:
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
-                    save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, opt=opt, scaler=scaler, args=args)
+                    save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms)
                     latest = ckpt_dir / "latest.pt"
-                    save_ckpt(latest, step=step, epoch=epoch, dyn_model=dyn, opt=opt, scaler=scaler, args=args)
+                    save_ckpt(latest, step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms)
 
                 step += 1
 
@@ -941,6 +998,8 @@ if __name__ == "__main__":
     p.add_argument("--n_register", type=int, default=4)
     p.add_argument("--n_agent", type=int, default=1)
     p.add_argument("--space_mode", type=str, default="wm_agent_isolated", choices=["wm_agent_isolated", "wm_agent"])
+    p.add_argument("--qk_norm", action="store_true")
+    p.add_argument("--attn_softcap", type=float, default=0.0)
 
     # shortcut / schedule
     p.add_argument("--k_max", type=int, default=8)
@@ -956,6 +1015,11 @@ if __name__ == "__main__":
     p.add_argument("--max_steps", type=int, default=10_000_000)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--warmup_steps", type=int, default=0)
+
+    # collapse tripwire (debug/pred_spread is logged every log_every steps)
+    p.add_argument("--collapse_check_after", type=int, default=1000)
+    p.add_argument("--collapse_spread_min", type=float, default=1e-3)
 
     # eval / viz
     p.add_argument("--eval_every", type=int, default=1_000)
