@@ -744,6 +744,7 @@ def train(args):
     t0 = time.time()
     grad_accum = max(1, int(args.grad_accum))
 
+    epoch = start_epoch  # bound even if the while-body is skipped (resume at/after max_steps)
     while step < args.max_steps:
         for epoch in range(start_epoch, 10_000_000):
             if sampler is not None:
@@ -950,6 +951,19 @@ def train(args):
                 step += 1
 
             start_epoch = epoch + 1
+            if step >= args.max_steps:
+                # The inner loader-loop already broke at max_steps; without this the outer
+                # epoch-loop (range up to 10M) keeps fetching one batch and breaking forever,
+                # pinning the GPU at 0% util and never re-checking the `while` guard. Break so
+                # training self-exits at max_steps.
+                break
+
+    # Always persist a final checkpoint at the last processed step, regardless of save_every
+    # alignment, so latest.pt matches the exact step where training stopped.
+    if is_rank0():
+        final_ckpt = ckpt_dir / f"step_{step:07d}.pt"
+        save_ckpt(final_ckpt, step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms)
+        save_ckpt(ckpt_dir / "latest.pt", step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms)
 
     if ddp:
         dist.barrier()
