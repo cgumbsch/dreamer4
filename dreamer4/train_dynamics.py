@@ -127,6 +127,8 @@ def load_frozen_tokenizer_from_pt_ckpt(
         mae_p_min=0.0,
         mae_p_max=0.0,
         scale_pos_embeds=bool(tok_args.get("scale_pos_embeds", True)),
+        qk_norm=bool(tok_args.get("qk_norm", False)),
+        attn_softcap=float(tok_args.get("attn_softcap", 0.0)),
     )
     dec = Decoder(
         d_bottleneck=int(tok_args.get("d_bottleneck", 32)),
@@ -141,6 +143,8 @@ def load_frozen_tokenizer_from_pt_ckpt(
         time_every=int(tok_args.get("time_every", 1)),
         latents_only_time=bool(tok_args.get("latents_only_time", True)),
         scale_pos_embeds=bool(tok_args.get("scale_pos_embeds", True)),
+        qk_norm=bool(tok_args.get("qk_norm", False)),
+        attn_softcap=float(tok_args.get("attn_softcap", 0.0)),
     )
 
     tok = Tokenizer(enc, dec)
