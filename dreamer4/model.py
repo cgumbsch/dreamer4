@@ -78,9 +78,9 @@ def temporal_unpatchify(patches_btnd: torch.Tensor, H: int, W: int, C: int, patc
     return out.reshape(B, T, C, H, W)
 
 
-def sinusoid_table(n: int, d: int, base: float = 10000.0, device=None) -> torch.Tensor:
+def sinusoid_table(n: int, d: int, base: float = 10000.0, device=None, start: int = 0) -> torch.Tensor:
     # fp32 by construction
-    pos = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1)  # (n,1)
+    pos = torch.arange(start, start + n, device=device, dtype=torch.float32).unsqueeze(1)  # (n,1)
     i   = torch.arange(d, device=device, dtype=torch.float32).unsqueeze(0)  # (1,d)
     k   = torch.floor(i / 2.0)
     # stable: exp(log(base) * exponent)
@@ -89,10 +89,10 @@ def sinusoid_table(n: int, d: int, base: float = 10000.0, device=None) -> torch.
     return torch.where((i % 2) == 0, torch.sin(ang), torch.cos(ang))  # (n,d) fp32
 
 
-def add_sinusoidal_positions(tokens_btSd: torch.Tensor, scale_pos_embeds) -> torch.Tensor:
+def add_sinusoidal_positions(tokens_btSd: torch.Tensor, scale_pos_embeds, t_offset: int = 0) -> torch.Tensor:
     B, T, S, D = tokens_btSd.shape
     device = tokens_btSd.device
-    pos_t = sinusoid_table(T, D, device=device)  # fp32
+    pos_t = sinusoid_table(T, D, device=device, start=t_offset)  # fp32
     pos_s = sinusoid_table(S, D, device=device)  # fp32
     if scale_pos_embeds:
         pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :]) * (1.0 / math.sqrt(D))
@@ -459,7 +459,7 @@ class Encoder(nn.Module):
         self.latents = nn.Parameter(torch.empty(n_latents, d_model))
         nn.init.normal_(self.latents, std=0.02)
 
-    def forward(self, patch_tokens_btnd: torch.Tensor):
+    def forward(self, patch_tokens_btnd: torch.Tensor, t_offset: int = 0):
         B, T, Np, Dp = patch_tokens_btnd.shape
         assert Np == self.n_patches
 
@@ -468,7 +468,7 @@ class Encoder(nn.Module):
 
         lat = self.latents.view(1, 1, self.n_latents, -1).expand(B, T, -1, -1)
         tokens = torch.cat([lat, proj_masked], dim=2)        # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds)
+        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset)
 
         enc = self.transformer(tokens)
         z = torch.tanh(self.bottleneck_proj(enc[:, :, :self.n_latents, :]))
@@ -517,14 +517,14 @@ class Decoder(nn.Module):
             qk_norm=qk_norm, attn_softcap=attn_softcap,
         )
 
-    def forward(self, z_btLd: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_btLd: torch.Tensor, t_offset: int = 0) -> torch.Tensor:
         B, T, L, _ = z_btLd.shape
         assert L == self.n_latents
 
         lat = torch.tanh(self.up_proj(z_btLd))                                 # (B,T,L,D)
         qry = self.patch_queries.view(1, 1, self.n_patches, -1).expand(B, T, -1, -1)
         tokens = torch.cat([lat, qry], dim=2)                                  # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds)
+        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset)
 
         x = self.transformer(tokens)
         x_p = x[:, :, L:, :]
@@ -532,14 +532,18 @@ class Decoder(nn.Module):
 
 
 class Tokenizer(nn.Module):
-    def __init__(self, encoder: Encoder, decoder: Decoder):
+    def __init__(self, encoder: Encoder, decoder: Decoder, pos_offset_max: int = 0):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.pos_offset_max = int(pos_offset_max)
 
     def forward(self, patches_btnd: torch.Tensor):
-        z, (mae_mask, keep_prob) = self.encoder(patches_btnd)
-        pred = self.decoder(z)
+        t_offset = 0
+        if self.training and self.pos_offset_max > 0:
+            t_offset = int(torch.randint(0, self.pos_offset_max + 1, (1,)).item())
+        z, (mae_mask, keep_prob) = self.encoder(patches_btnd, t_offset)
+        pred = self.decoder(z, t_offset)
         return pred, mae_mask, keep_prob
 
 

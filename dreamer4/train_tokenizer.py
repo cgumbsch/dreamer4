@@ -222,7 +222,7 @@ def train(args):
         qk_norm=args.qk_norm,
         attn_softcap=args.attn_softcap,
     )
-    model = Tokenizer(enc, dec).to(device)
+    model = Tokenizer(enc, dec, pos_offset_max=args.pos_offset_max).to(device)
 
     if is_rank0():
         print(model)
@@ -462,6 +462,8 @@ if __name__ == "__main__":
     p.add_argument("--mae_p_min", type=float, default=0.0)
     p.add_argument("--mae_p_max", type=float, default=0.9)
     p.add_argument("--qk_norm", action="store_true")
+    p.add_argument("--pos_offset_max", type=int, default=0,
+                   help="sample temporal position start in [0,N] each step; 0 disables")
     p.add_argument("--attn_softcap", type=float, default=0.0)
 
     # Better performance without scale_pos_embeds (set to False)
