@@ -700,6 +700,7 @@ def train(args):
         scale_pos_embeds=args.scale_pos_embeds,
         qk_norm=args.qk_norm,
         attn_softcap=args.attn_softcap,
+        pos_offset_max=args.pos_offset_max,
     ).to(device)
 
     if is_rank0():
@@ -1017,6 +1018,8 @@ if __name__ == "__main__":
     p.add_argument("--n_agent", type=int, default=1)
     p.add_argument("--space_mode", type=str, default="wm_agent_isolated", choices=["wm_agent_isolated", "wm_agent"])
     p.add_argument("--qk_norm", action="store_true")
+    p.add_argument("--pos_offset_max", type=int, default=0,
+                   help="sample dynamics temporal position start in [0,N] each step; 0 disables")
     p.add_argument("--attn_softcap", type=float, default=0.0)
 
     # shortcut / schedule

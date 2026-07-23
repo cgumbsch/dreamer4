@@ -663,6 +663,7 @@ class Dynamics(nn.Module):
         scale_pos_embeds: bool = True,
         qk_norm: bool = False,
         attn_softcap: float = 0.0,
+        pos_offset_max: int = 0,
     ):
         super().__init__()
         assert d_spatial % d_bottleneck == 0, "expected packing: d_spatial = d_bottleneck * packing_factor"
@@ -673,6 +674,7 @@ class Dynamics(nn.Module):
         self.n_agent = int(n_agent)
         self.k_max = int(k_max)
         self.scale_pos_embeds = scale_pos_embeds
+        self.pos_offset_max = int(pos_offset_max)
 
         self.spatial_proj = nn.Linear(self.d_spatial, self.d_model)
         self.register_tokens = nn.Parameter(torch.empty(self.n_register, self.d_model))
@@ -754,7 +756,10 @@ class Dynamics(nn.Module):
             toks = [action_tokens, sig_tok, step_tok, spatial_tokens, reg]
 
         tokens = torch.cat(toks, dim=2)  # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds)
+        t_offset = 0
+        if self.training and self.pos_offset_max > 0:
+            t_offset = int(torch.randint(0, self.pos_offset_max + 1, (1,)).item())
+        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset)
         x = self.transformer(tokens)
 
         spatial_out = x[:, :, self.spatial_slice, :]
