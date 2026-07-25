@@ -206,6 +206,7 @@ def train(args):
         scale_pos_embeds=args.scale_pos_embeds,
         qk_norm=args.qk_norm,
         attn_softcap=args.attn_softcap,
+        rope=args.rope,
     )
     dec = Decoder(
         d_bottleneck=args.d_bottleneck,
@@ -221,6 +222,7 @@ def train(args):
         scale_pos_embeds=args.scale_pos_embeds,
         qk_norm=args.qk_norm,
         attn_softcap=args.attn_softcap,
+        rope=args.rope,
     )
     model = Tokenizer(enc, dec, pos_offset_max=args.pos_offset_max).to(device)
 
@@ -462,6 +464,8 @@ if __name__ == "__main__":
     p.add_argument("--mae_p_min", type=float, default=0.0)
     p.add_argument("--mae_p_max", type=float, default=0.9)
     p.add_argument("--qk_norm", action="store_true")
+    p.add_argument("--rope", action="store_true",
+                   help="rotary temporal positions instead of the absolute sinusoidal time table")
     p.add_argument("--pos_offset_max", type=int, default=0,
                    help="sample temporal position start in [0,N] each step; 0 disables")
     p.add_argument("--attn_softcap", type=float, default=0.0)

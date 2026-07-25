@@ -129,6 +129,7 @@ def load_frozen_tokenizer_from_pt_ckpt(
         scale_pos_embeds=bool(tok_args.get("scale_pos_embeds", True)),
         qk_norm=bool(tok_args.get("qk_norm", False)),
         attn_softcap=float(tok_args.get("attn_softcap", 0.0)),
+        rope=bool(tok_args.get("rope", False)),
     )
     dec = Decoder(
         d_bottleneck=int(tok_args.get("d_bottleneck", 32)),
@@ -145,6 +146,7 @@ def load_frozen_tokenizer_from_pt_ckpt(
         scale_pos_embeds=bool(tok_args.get("scale_pos_embeds", True)),
         qk_norm=bool(tok_args.get("qk_norm", False)),
         attn_softcap=float(tok_args.get("attn_softcap", 0.0)),
+        rope=bool(tok_args.get("rope", False)),
     )
 
     tok = Tokenizer(enc, dec)
@@ -701,6 +703,7 @@ def train(args):
         qk_norm=args.qk_norm,
         attn_softcap=args.attn_softcap,
         pos_offset_max=args.pos_offset_max,
+        rope=args.rope,
     ).to(device)
 
     if is_rank0():
@@ -1018,6 +1021,8 @@ if __name__ == "__main__":
     p.add_argument("--n_agent", type=int, default=1)
     p.add_argument("--space_mode", type=str, default="wm_agent_isolated", choices=["wm_agent_isolated", "wm_agent"])
     p.add_argument("--qk_norm", action="store_true")
+    p.add_argument("--rope", action="store_true",
+                   help="rotary temporal positions instead of the absolute sinusoidal time table")
     p.add_argument("--pos_offset_max", type=int, default=0,
                    help="sample dynamics temporal position start in [0,N] each step; 0 disables")
     p.add_argument("--attn_softcap", type=float, default=0.0)

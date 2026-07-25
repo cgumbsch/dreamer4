@@ -89,17 +89,60 @@ def sinusoid_table(n: int, d: int, base: float = 10000.0, device=None, start: in
     return torch.where((i % 2) == 0, torch.sin(ang), torch.cos(ang))  # (n,d) fp32
 
 
-def add_sinusoidal_positions(tokens_btSd: torch.Tensor, scale_pos_embeds, t_offset: int = 0) -> torch.Tensor:
+def add_sinusoidal_positions(tokens_btSd: torch.Tensor, scale_pos_embeds, t_offset: int = 0,
+                             add_time: bool = True) -> torch.Tensor:
     B, T, S, D = tokens_btSd.shape
     device = tokens_btSd.device
-    pos_t = sinusoid_table(T, D, device=device, start=t_offset)  # fp32
     pos_s = sinusoid_table(S, D, device=device)  # fp32
+    pos = pos_s[None, None, :, :]
+    if add_time:
+        # skipped when rotary handles the time axis, so time is not encoded twice
+        pos_t = sinusoid_table(T, D, device=device, start=t_offset)  # fp32
+        pos = pos_t[None, :, None, :] + pos
     if scale_pos_embeds:
-        pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :]) * (1.0 / math.sqrt(D))
-    else:
-        pos = (pos_t[None, :, None, :] + pos_s[None, None, :, :])
+        pos = pos * (1.0 / math.sqrt(D))
 
     return tokens_btSd + pos.to(dtype=tokens_btSd.dtype)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    # x: (...,D), D even; pairs element i with i + D/2, matching the cos/sin layout below
+    d = x.shape[-1] // 2
+    return torch.cat((-x[..., d:], x[..., :d]), dim=-1)
+
+
+def apply_rope(x_nhld: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # x: (N,H,L,Dh); cos/sin: (L,Dh)
+    return (x_nhld * cos[None, None, :, :]) + (_rotate_half(x_nhld) * sin[None, None, :, :])
+
+
+class RotaryEmbedding(nn.Module):
+    """Rotary position embedding. Holds no parameters and no persistent buffers."""
+
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        assert dim % 2 == 0, "rope dim must be even"
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._cos_cached: Optional[torch.Tensor] = None
+        self._sin_cached: Optional[torch.Tensor] = None
+        self._cached_len = 0
+        self._cache_device: Optional[torch.device] = None
+
+    def get_cos_sin(self, seq_len: int, *, device, dtype, offset: int = 0):
+        needed = int(seq_len) + int(offset)
+        if (self._cos_cached is None or self._cached_len < needed or self._cache_device != device):
+            # built and cached in fp32, cast on use
+            t = torch.arange(needed, device=device, dtype=torch.float32)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device=device))  # (needed, D/2)
+            emb = torch.cat([freqs, freqs], dim=-1)                              # (needed, D)
+            self._cos_cached = emb.cos()
+            self._sin_cached = emb.sin()
+            self._cached_len = needed
+            self._cache_device = device
+        cos = self._cos_cached[offset:offset + seq_len].to(dtype=dtype)
+        sin = self._sin_cached[offset:offset + seq_len].to(dtype=dtype)
+        return cos, sin
 
 
 class EmaRms(nn.Module):
@@ -192,7 +235,7 @@ class MLP(nn.Module):
 
 class MultiheadSelfAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0,
-                 qk_norm: bool = False, attn_softcap: float = 0.0):
+                 qk_norm: bool = False, attn_softcap: float = 0.0, rope: bool = False):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
@@ -206,6 +249,7 @@ class MultiheadSelfAttention(nn.Module):
         # optional per-head q/k RMS normalization; no params created when disabled
         self.q_norm = RMSNorm(self.head_dim) if qk_norm else None
         self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
+        self.rope = RotaryEmbedding(self.head_dim) if rope else None
 
     def forward(self, x_nld: torch.Tensor, *, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False):
         """
@@ -222,6 +266,13 @@ class MultiheadSelfAttention(nn.Module):
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
+
+        # rotary last: a per-dim norm applied after it would not commute with the rotation,
+        # which is what makes the logits depend on relative position only
+        if self.rope is not None:
+            cos, sin = self.rope.get_cos_sin(L, device=x_nld.device, dtype=q.dtype)
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
 
         drop = self.dropout_p if self.training else 0.0
         if self.attn_softcap > 0.0:
@@ -313,12 +364,12 @@ class SpaceSelfAttentionModality(nn.Module):
 
 class TimeSelfAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float, latents_only: bool, n_latents: int,
-                 qk_norm: bool = False, attn_softcap: float = 0.0):
+                 qk_norm: bool = False, attn_softcap: float = 0.0, rope: bool = False):
         super().__init__()
         self.latents_only = bool(latents_only)
         self.n_latents = int(n_latents)
         self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout,
-                                           qk_norm=qk_norm, attn_softcap=attn_softcap)
+                                           qk_norm=qk_norm, attn_softcap=attn_softcap, rope=rope)
 
     def forward(self, x_btSd: torch.Tensor) -> torch.Tensor:
         B, T, S, D = x_btSd.shape
@@ -352,6 +403,7 @@ class BlockCausalLayer(nn.Module):
         latents_only_time: bool,
         qk_norm: bool = False,
         attn_softcap: float = 0.0,
+        rope: bool = False,
     ):
         super().__init__()
         self.do_time = ((layer_index + 1) % time_every == 0)
@@ -364,7 +416,7 @@ class BlockCausalLayer(nn.Module):
         if self.do_time:
             self.norm2 = RMSNorm(d_model)
             self.time = TimeSelfAttention(d_model, n_heads, dropout, latents_only_time, n_latents,
-                                          qk_norm=qk_norm, attn_softcap=attn_softcap)
+                                          qk_norm=qk_norm, attn_softcap=attn_softcap, rope=rope)
             self.drop2 = nn.Dropout(dropout)
 
         self.norm3 = RMSNorm(d_model)
@@ -393,6 +445,7 @@ class BlockCausalTransformer(nn.Module):
         latents_only_time: bool,
         qk_norm: bool = False,
         attn_softcap: float = 0.0,
+        rope: bool = False,
     ):
         super().__init__()
         self.layers = nn.ModuleList([
@@ -402,7 +455,7 @@ class BlockCausalTransformer(nn.Module):
                 dropout=dropout, mlp_ratio=mlp_ratio,
                 layer_index=i, time_every=time_every,
                 latents_only_time=latents_only_time,
-                qk_norm=qk_norm, attn_softcap=attn_softcap,
+                qk_norm=qk_norm, attn_softcap=attn_softcap, rope=rope,
             )
             for i in range(depth)
         ])
@@ -433,12 +486,14 @@ class Encoder(nn.Module):
         scale_pos_embeds: bool = True,
         qk_norm: bool = False,
         attn_softcap: float = 0.0,
+        rope: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.n_latents = n_latents
         self.n_patches = n_patches
         self.scale_pos_embeds = scale_pos_embeds
+        self.rope = bool(rope)
 
         self.patch_proj = nn.Linear(patch_dim, d_model)
         self.bottleneck_proj = nn.Linear(d_model, d_bottleneck)
@@ -452,7 +507,7 @@ class Encoder(nn.Module):
             space_mode="encoder",
             dropout=dropout, mlp_ratio=mlp_ratio,
             time_every=time_every, latents_only_time=latents_only_time,
-            qk_norm=qk_norm, attn_softcap=attn_softcap,
+            qk_norm=qk_norm, attn_softcap=attn_softcap, rope=rope,
         )
         self.mae = MAEReplacer(d_model=d_model, p_min=mae_p_min, p_max=mae_p_max)
 
@@ -468,7 +523,8 @@ class Encoder(nn.Module):
 
         lat = self.latents.view(1, 1, self.n_latents, -1).expand(B, T, -1, -1)
         tokens = torch.cat([lat, proj_masked], dim=2)        # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset)
+        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset,
+                                          add_time=not self.rope)
 
         enc = self.transformer(tokens)
         z = torch.tanh(self.bottleneck_proj(enc[:, :, :self.n_latents, :]))
@@ -493,11 +549,13 @@ class Decoder(nn.Module):
         scale_pos_embeds: bool = True,
         qk_norm: bool = False,
         attn_softcap: float = 0.0,
+        rope: bool = False,
     ):
         super().__init__()
         self.n_latents = n_latents
         self.n_patches = n_patches
         self.scale_pos_embeds = scale_pos_embeds
+        self.rope = bool(rope)
 
         self.up_proj = nn.Linear(d_bottleneck, d_model)
         self.patch_queries = nn.Parameter(torch.empty(n_patches, d_model))
@@ -514,7 +572,7 @@ class Decoder(nn.Module):
             space_mode="decoder",
             dropout=dropout, mlp_ratio=mlp_ratio,
             time_every=time_every, latents_only_time=latents_only_time,
-            qk_norm=qk_norm, attn_softcap=attn_softcap,
+            qk_norm=qk_norm, attn_softcap=attn_softcap, rope=rope,
         )
 
     def forward(self, z_btLd: torch.Tensor, t_offset: int = 0) -> torch.Tensor:
@@ -524,7 +582,8 @@ class Decoder(nn.Module):
         lat = torch.tanh(self.up_proj(z_btLd))                                 # (B,T,L,D)
         qry = self.patch_queries.view(1, 1, self.n_patches, -1).expand(B, T, -1, -1)
         tokens = torch.cat([lat, qry], dim=2)                                  # (B,T,S,D)
-        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset)
+        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset,
+                                          add_time=not self.rope)
 
         x = self.transformer(tokens)
         x_p = x[:, :, L:, :]
@@ -537,6 +596,9 @@ class Tokenizer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.pos_offset_max = int(pos_offset_max)
+        if self.pos_offset_max > 0 and getattr(encoder, "rope", False):
+            # rope has no absolute time table to offset; the flag would silently do nothing
+            raise ValueError("pos_offset_max has no effect with rope enabled")
 
     def forward(self, patches_btnd: torch.Tensor):
         t_offset = 0
@@ -664,6 +726,7 @@ class Dynamics(nn.Module):
         qk_norm: bool = False,
         attn_softcap: float = 0.0,
         pos_offset_max: int = 0,
+        rope: bool = False,
     ):
         super().__init__()
         assert d_spatial % d_bottleneck == 0, "expected packing: d_spatial = d_bottleneck * packing_factor"
@@ -675,6 +738,10 @@ class Dynamics(nn.Module):
         self.k_max = int(k_max)
         self.scale_pos_embeds = scale_pos_embeds
         self.pos_offset_max = int(pos_offset_max)
+        self.rope = bool(rope)
+        if self.pos_offset_max > 0 and self.rope:
+            # rope has no absolute time table to offset; the flag would silently do nothing
+            raise ValueError("pos_offset_max has no effect with rope enabled")
 
         self.spatial_proj = nn.Linear(self.d_spatial, self.d_model)
         self.register_tokens = nn.Parameter(torch.empty(self.n_register, self.d_model))
@@ -716,6 +783,7 @@ class Dynamics(nn.Module):
             latents_only_time=False,
             qk_norm=qk_norm,
             attn_softcap=attn_softcap,
+            rope=rope,
         )
 
         self.flow_x_head = nn.Linear(self.d_model, self.d_spatial)
@@ -759,7 +827,8 @@ class Dynamics(nn.Module):
         t_offset = 0
         if self.training and self.pos_offset_max > 0:
             t_offset = int(torch.randint(0, self.pos_offset_max + 1, (1,)).item())
-        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset)
+        tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset,
+                                          add_time=not self.rope)
         x = self.transformer(tokens)
 
         spatial_out = x[:, :, self.spatial_slice, :]
