@@ -617,6 +617,7 @@ def train(args):
     seed_everything(args.seed + rank)
 
     # Dataset and DataLoader
+    tasks = args.tasks if args.tasks else TASK_SET
     if args.use_actions:
         from wm_dataset import WMDataset, collate_batch
         dataset = WMDataset(
@@ -626,7 +627,7 @@ def train(args):
             img_size=128,
             action_dim=16,
             tasks_json=args.tasks_json,
-            tasks=TASK_SET,
+            tasks=tasks,
             verbose=is_rank0(),
         )
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
@@ -645,9 +646,14 @@ def train(args):
     else:
         dataset = ShardedFrameDataset(
             outdirs=args.frame_dirs,
-            tasks=TASK_SET,
+            tasks=tasks,
             seq_len=args.seq_len,
         )
+        if len(dataset) == 0:
+            raise RuntimeError(
+                f"empty dataset: no shards for tasks={list(tasks)} under {list(args.frame_dirs)} "
+                f"(seq_len={args.seq_len}). The training loop would spin at step 0 forever."
+            )
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
         loader = DataLoader(
             dataset,
@@ -993,6 +999,8 @@ if __name__ == "__main__":
         "/<path>/mixed-large-shards",
     ])
     p.add_argument("--tasks_json", type=str, default="../tasks.json")  # task metadata
+    p.add_argument("--tasks", type=str, nargs="+", default=None,   # default: task_set.TASK_SET
+                   help="task names to load from --data_dirs / --frame_dirs")
     p.add_argument("--seq_len", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=24)

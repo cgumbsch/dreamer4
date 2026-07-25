@@ -162,12 +162,18 @@ def train(args):
     seed_everything(args.seed + rank)
 
     # ---- data ----
+    tasks = args.tasks if args.tasks else TASK_SET
     dataset = ShardedFrameDataset(
         outdirs=args.data_dirs,
-        tasks=TASK_SET,
+        tasks=tasks,
         seq_len=args.seq_len,
         iid_sampling=True,
     )
+    if len(dataset) == 0:
+        raise RuntimeError(
+            f"empty dataset: no shards for tasks={list(tasks)} under {list(args.data_dirs)} "
+            f"(seq_len={args.seq_len}). The training loop would spin at step 0 forever."
+        )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
 
@@ -442,6 +448,8 @@ if __name__ == "__main__":
         "/<path>/mixed-small-shards",
         "/<path>/mixed-large-shards",
     ])
+    p.add_argument("--tasks", type=str, nargs="+", default=None,   # default: task_set.TASK_SET
+                   help="task subdirectories to read under --data_dirs")
     p.add_argument("--seq_len", type=int, default=8)
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=8)
