@@ -266,7 +266,8 @@ def log_eval_video_wandb(model, dataset, *, device, args, use_amp, step: int):
             out, save_all=True, append_images=pil[1:], loop=0,
             duration=int(1000 / max(1, args.eval_viz_fps)), optimize=False,
         )
-        media["val/recon_video"] = wandb.Video(str(out), caption=caption)
+        # format is explicit: wandb warns that it becomes required in a future release
+        media["val/recon_video"] = wandb.Video(str(out), caption=caption, format="gif")
     except Exception as e:  # a broken panel must never take down a multi-day run
         print(f"[eval] recon video skipped at step {step}: {type(e).__name__}: {e}")
 
