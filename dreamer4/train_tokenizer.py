@@ -126,6 +126,141 @@ def log_tokenizer_viz_wandb(
     )
 
 
+class _NoMAE:
+    """Temporarily disable MAE masking, so a forward is plain autoencoding.
+
+    The masker is not gated on self.training and draws a mask ratio on every forward.
+    """
+
+    def __init__(self, model):
+        self.mae = (model.module if hasattr(model, "module") else model).encoder.mae
+
+    def __enter__(self):
+        self.saved = (self.mae.p_min, self.mae.p_max)
+        self.mae.p_min = self.mae.p_max = 0.0
+        return self
+
+    def __exit__(self, *exc):
+        self.mae.p_min, self.mae.p_max = self.saved
+        return False
+
+
+@torch.no_grad()
+def evaluate(model, loader, *, device, args, lpips_fn, use_amp, step: int):
+    """Held-out metrics, logged under val/*.
+
+    Two forwards per batch: masked (the training objective on unseen shards) and unmasked
+    (plain autoencoding, for psnr and the latent statistics).
+
+    The RNG is seeded to a fixed value for the duration, so successive evals draw the same MAE
+    masks, and restored afterwards, so an eval does not shift the training data order.
+    """
+    was_training = model.training
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    model.eval()
+    seed_everything(args.eval_seed)
+
+    enc = (model.module if hasattr(model, "module") else model).encoder
+    n = 0
+    sum_mse = sum_lp = sum_full_mse = sum_sat = 0.0
+    z_flat = []
+    try:
+        for x in loader:
+            x = x.to(device, non_blocking=True)
+            patches = temporal_patchify(x, args.patch)
+
+            with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                pred, mae_mask, _ = model(patches)
+            sum_mse += float(recon_loss_from_mae(pred, patches, mae_mask).item())
+            if lpips_fn is not None and args.lpips_weight > 0.0:
+                sum_lp += float(lpips_on_mae_recon(
+                    lpips_fn, pred, patches, mae_mask,
+                    H=args.H, W=args.W, C=args.C, patch=args.patch,
+                    subsample_frac=args.lpips_frac,
+                ).item())
+
+            with _NoMAE(model), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                pred_full, _, _ = model(patches)
+                z, _ = enc(patches)
+            sum_full_mse += float((pred_full.float() - patches.float()).pow(2).mean().item())
+            zf = z.float()
+            sum_sat += float((zf.abs() > 0.999).float().mean().item())
+            z_flat.append(zf.flatten(1).cpu())
+            n += 1
+    finally:
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+        if was_training:
+            model.train()
+
+    if n == 0:
+        return
+
+    full_mse = sum_full_mse / n
+    zc = torch.cat(z_flat, dim=0)
+    # mean L2 distance of a clip's latent from the mean latent (not debug/z_spread, a per-dim std)
+    spread = float((zc - zc.mean(dim=0, keepdim=True)).norm(dim=1).mean().item())
+    wandb.log(
+        {
+            "val/mse": sum_mse / n,
+            "val/lpips": sum_lp / n,
+            "val/full_mse": full_mse,
+            "val/psnr": 10.0 * np.log10(1.0 / max(full_mse, 1e-10)),
+            "val/z_sat_frac": sum_sat / n,
+            "val/z_between_clip_spread": spread,
+            "val/clips": int(zc.shape[0]),
+        },
+        step=step,
+    )
+    print(
+        f"[eval] step {step:07d} | val_mse={sum_mse / n:.6f} | val_lpips={sum_lp / n:.4f} "
+        f"| val_psnr={10.0 * np.log10(1.0 / max(full_mse, 1e-10)):.2f} "
+        f"| z_sat={sum_sat / n:.4f} | z_spread={spread:.4f}"
+    )
+
+
+@torch.no_grad()
+def log_eval_video_wandb(model, dataset, *, device, args, use_amp, step: int):
+    """A held-out reconstruction video: ground truth on top, reconstruction below.
+
+    Always the same clip, so the panel tracks the model rather than resampling the data. Clips
+    longer than seq_len are encoded in consecutive seq_len windows and concatenated.
+    """
+    n_chunks = max(1, args.eval_viz_frames // args.seq_len)
+    if len(dataset) < (n_chunks - 1) * args.seq_len + 1:
+        n_chunks = 1
+
+    was_training = model.training
+    model.eval()
+    try:
+        # Fixed, non-overlapping, consecutive windows from the head of the held-out set.
+        clip = torch.stack([dataset[i * args.seq_len] for i in range(n_chunks)]).to(device)
+        with _NoMAE(model), autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            pred, _, _ = model(temporal_patchify(clip, args.patch))
+        recon = temporal_unpatchify(pred.float(), args.H, args.W, args.C, args.patch)
+    finally:
+        if was_training:
+            model.train()
+
+    # (n_chunks,T,C,H,W) -> (n_chunks*T,C,H,W), i.e. back into one continuous clip
+    gt = clip.reshape(-1, args.C, args.H, args.W)
+    rc = recon.reshape(-1, args.C, args.H, args.W)
+    panel = torch.cat([gt, rc], dim=2)  # stack over H: truth above, recon below
+    frames = (panel.clamp(0, 1) * 255.0).to(torch.uint8).cpu().numpy()
+
+    wandb.log(
+        {
+            "val/recon_video": wandb.Video(
+                frames, fps=args.eval_viz_fps, format="mp4",
+                caption=f"step {step} | top=ground truth, bottom=reconstruction (held-out)",
+            )
+        },
+        step=step,
+    )
+
+
 def save_ckpt(path: Path, *, step: int, epoch: int, model, opt, args: argparse.Namespace, rms=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     obj = {
@@ -168,12 +303,52 @@ def train(args):
         tasks=tasks,
         seq_len=args.seq_len,
         iid_sampling=True,
+        split=("train" if args.val_stride > 0 else "all"),
+        val_stride=args.val_stride,
     )
     if len(dataset) == 0:
         raise RuntimeError(
             f"empty dataset: no shards for tasks={list(tasks)} under {list(args.data_dirs)} "
             f"(seq_len={args.seq_len}). The training loop would spin at step 0 forever."
         )
+
+    # ---- held-out split ----
+    val_dataset = None
+    val_loader = None
+    if args.val_stride > 0:
+        val_dataset = ShardedFrameDataset(
+            outdirs=args.data_dirs,
+            tasks=tasks,
+            seq_len=args.seq_len,
+            iid_sampling=False,       # eval must be a FIXED set, not a fresh sample each time
+            split="val",
+            val_stride=args.val_stride,
+        )
+        if len(val_dataset) == 0:
+            raise RuntimeError(
+                f"empty validation split: val_stride={args.val_stride} held out no shards. "
+                f"Lower it, or set --val_stride 0 to train without a held-out set."
+            )
+        # Spread the eval clips evenly over the whole held-out set instead of taking the first N,
+        # which would all come from one shard -- i.e. one stretch of one episode. Ascending order
+        # also lets the dataset's one-shard cache do its job.
+        n_clips = max(1, args.eval_batches * args.batch_size)
+        idx = torch.linspace(0, len(val_dataset) - 1, min(n_clips, len(val_dataset)))
+        val_subset = torch.utils.data.Subset(val_dataset, idx.long().tolist())
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=min(2, args.num_workers),
+            pin_memory=True,
+            drop_last=False,
+        )
+        if is_rank0():
+            print(
+                f"[val] held out every {args.val_stride}th shard: "
+                f"{len(val_dataset.shards)} shards / {len(val_dataset):,} starts; "
+                f"eval on {len(val_subset)} fixed clips"
+            )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
 
@@ -407,6 +582,19 @@ def train(args):
                         max_T=args.viz_max_T,
                     )
 
+                # ---- held-out eval ----
+                # After the viz block so a single step can do both, and before the checkpoint so a
+                # ckpt is never written from a model left in eval mode by a crash in between.
+                if (is_rank0() and val_loader is not None
+                        and args.eval_every > 0 and (step % args.eval_every == 0)):
+                    evaluate(model, val_loader, device=device, args=args,
+                             lpips_fn=lpips_fn, use_amp=use_amp, step=step)
+
+                if (is_rank0() and val_dataset is not None
+                        and args.eval_viz_every > 0 and (step % args.eval_viz_every == 0)):
+                    log_eval_video_wandb(model, val_dataset, device=device, args=args,
+                                         use_amp=use_amp, step=step)
+
                 # ---- ckpt ----
                 # save on optimizer boundaries (compatible with grad_accum > 1)
                 if is_rank0() and args.save_every > 0 and do_step and (step % args.save_every) < grad_accum:
@@ -506,6 +694,24 @@ if __name__ == "__main__":
     p.add_argument("--viz_every", type=int, default=500)
     p.add_argument("--viz_max_items", type=int, default=4)
     p.add_argument("--viz_max_T", type=int, default=8)
+
+    # ---- held-out evaluation (all default off: 0 reproduces a run without a validation split) ----
+    p.add_argument("--val_stride", type=int, default=0,
+                   help="hold out every Nth shard for validation (0 = train on everything). "
+                        "Whole shards, because neighbouring video frames leak across a frame split")
+    p.add_argument("--eval_every", type=int, default=0,
+                   help="micro-steps between held-out evals (0 = off). Compared against the MICRO "
+                        "counter like warmup_steps, so scale it by grad_accum to think in updates")
+    p.add_argument("--eval_batches", type=int, default=8,
+                   help="batches per eval; eval_batches*batch_size clips, fixed for the whole run")
+    p.add_argument("--eval_seed", type=int, default=1234,
+                   help="RNG seed held during eval so the MAE mask is identical every time; the "
+                        "training RNG state is saved and restored around it")
+    p.add_argument("--eval_viz_every", type=int, default=0,
+                   help="micro-steps between held-out reconstruction videos (0 = off)")
+    p.add_argument("--eval_viz_frames", type=int, default=32,
+                   help="frames in that video, encoded in consecutive seq_len windows")
+    p.add_argument("--eval_viz_fps", type=int, default=8)
 
     # wandb
     p.add_argument("--wandb_project", type=str, default="dreamer4-tokenizer")

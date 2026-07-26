@@ -18,6 +18,13 @@ class ShardedFrameDataset(Dataset):
 
     If iid_sampling=True, ignores idx and samples a random starting position
     uniformly over all valid sequence starts across all shards.
+
+    Held-out split: with val_stride > 0, every val_stride'th shard in discovery order is
+    reserved for validation; split="train" excludes those shards, split="val" keeps only them.
+    The split unit is a whole shard, since frames within one are highly correlated. A stride
+    rather than a suffix, so the split does not coincide with collection order.
+
+    split="all" (the default) or val_stride=0 keeps every shard, in the original order.
     """
 
     def __init__(
@@ -26,6 +33,8 @@ class ShardedFrameDataset(Dataset):
         tasks: Sequence[str] = (),
         seq_len: int = 16,
         iid_sampling: bool = True,
+        split: str = "all",
+        val_stride: int = 0,
     ):
         super().__init__()
         assert outdirs is not None, "outdirs must be specified"
@@ -38,7 +47,14 @@ class ShardedFrameDataset(Dataset):
         self.tasks = list(tasks)
         self.seq_len = int(seq_len)
         self.iid_sampling = bool(iid_sampling)
+        self.split = str(split)
+        self.val_stride = int(val_stride)
+        if self.split not in ("all", "train", "val"):
+            raise ValueError(f"split must be one of 'all'/'train'/'val', got {self.split!r}")
+        if self.split == "val" and self.val_stride <= 0:
+            raise ValueError("split='val' needs val_stride > 0, else the split is empty")
 
+        found: List[Dict] = []
         self.shards: List[Dict] = []
         self.cum_starts: List[int] = []
         total_starts = 0
@@ -75,19 +91,28 @@ class ShardedFrameDataset(Dataset):
                         continue
 
                     num_starts = N - self.seq_len + 1
-                    self.shards.append(
+                    found.append(
                         {"path": str(path), "num_frames": N, "num_starts": num_starts}
                     )
-                    total_starts += num_starts
-                    self.cum_starts.append(total_starts)
+
+        # partition after discovery, so the stride runs over all roots/tasks rather than per task
+        if self.val_stride > 0 and self.split != "all":
+            want_val = self.split == "val"
+            found = [s for i, s in enumerate(found) if ((i % self.val_stride) == 0) == want_val]
+
+        for meta in found:
+            self.shards.append(meta)
+            total_starts += meta["num_starts"]
+            self.cum_starts.append(total_starts)
 
         self.total_starts = total_starts
+        split_note = "" if self.split == "all" else f", split={self.split} (val_stride={self.val_stride})"
         if self.total_starts == 0:
-            print("[ShardedFrameDataset] WARNING: no usable sequences found in outdirs")
+            print(f"[ShardedFrameDataset] WARNING: no usable sequences found in outdirs{split_note}")
         else:
             print(
                 f"[ShardedFrameDataset] roots={len(self.outdirs)}, "
-                f"shards={len(self.shards):,}, seq_starts={self.total_starts:,}"
+                f"shards={len(self.shards):,}, seq_starts={self.total_starts:,}{split_note}"
             )
 
         # simple one-shard cache
