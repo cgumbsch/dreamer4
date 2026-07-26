@@ -740,7 +740,7 @@ def train(args):
             project=args.wandb_project,
             name=args.wandb_run_name,
             entity=args.wandb_entity,
-            mode="online",
+            mode=os.environ.get("WANDB_MODE", "online"),
             config=vars(args),
         )
 
