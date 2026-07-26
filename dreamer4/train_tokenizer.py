@@ -3,6 +3,7 @@ import os
 import time
 import random
 import argparse
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -249,16 +250,30 @@ def log_eval_video_wandb(model, dataset, *, device, args, use_amp, step: int):
     rc = recon.reshape(-1, args.C, args.H, args.W)
     panel = torch.cat([gt, rc], dim=2)  # stack over H: truth above, recon below
     frames = (panel.clamp(0, 1) * 255.0).to(torch.uint8).cpu().numpy()
+    frames_hwc = np.transpose(frames, (0, 2, 3, 1))  # (T,H,W,C) for PIL
 
-    wandb.log(
-        {
-            "val/recon_video": wandb.Video(
-                frames, fps=args.eval_viz_fps, format="mp4",
-                caption=f"step {step} | top=ground truth, bottom=reconstruction (held-out)",
-            )
-        },
-        step=step,
-    )
+    # Encode the GIF here rather than handing wandb.Video a raw array: that path needs moviepy,
+    # which is not in this environment, and mp4 compression would add block artifacts of its own
+    # to a panel whose purpose is judging them. A file path needs no extra dependency.
+    caption = f"step {step} | top=ground truth, bottom=reconstruction (held-out)"
+    media = {}
+    try:
+        from PIL import Image
+
+        pil = [Image.fromarray(f) for f in frames_hwc]
+        out = Path(tempfile.gettempdir()) / f"eval_recon_{step:07d}.gif"
+        pil[0].save(
+            out, save_all=True, append_images=pil[1:], loop=0,
+            duration=int(1000 / max(1, args.eval_viz_fps)), optimize=False,
+        )
+        media["val/recon_video"] = wandb.Video(str(out), caption=caption)
+    except Exception as e:  # a broken panel must never take down a multi-day run
+        print(f"[eval] recon video skipped at step {step}: {type(e).__name__}: {e}")
+
+    # Also a lossless strip: the GIF is palettised, and this panel exists to judge artefacts.
+    strip = np.concatenate(list(frames_hwc), axis=1)  # (H, T*W, C)
+    media["val/recon_frames"] = wandb.Image(strip, caption=caption)
+    wandb.log(media, step=step)
 
 
 def save_ckpt(path: Path, *, step: int, epoch: int, model, opt, args: argparse.Namespace, rms=None):
