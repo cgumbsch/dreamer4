@@ -1027,7 +1027,8 @@ if __name__ == "__main__":
     p.add_argument("--packing_factor", type=int, default=2)
     p.add_argument("--n_register", type=int, default=4)
     p.add_argument("--n_agent", type=int, default=1)
-    p.add_argument("--space_mode", type=str, default="wm_agent_isolated", choices=["wm_agent_isolated", "wm_agent"])
+    p.add_argument("--space_mode", type=str, default="wm_agent_isolated",
+                   choices=["wm_agent_isolated", "wm_agent_oneway", "wm_agent"])
     p.add_argument("--qk_norm", action="store_true")
     p.add_argument("--rope", action="store_true",
                    help="rotary temporal positions instead of the absolute sinusoidal time table")

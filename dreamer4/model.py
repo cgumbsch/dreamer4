@@ -336,9 +336,9 @@ class SpaceSelfAttentionModality(nn.Module):
             # full mixing across modalities
             return torch.ones((S, S), dtype=torch.bool, device=device)
 
-        if self.mode == "wm_agent_isolated":
+        if self.mode in ("wm_agent_isolated", "wm_agent_oneway"):
             # non-agent tokens: can attend to everything EXCEPT agent tokens
-            # agent tokens: attend only to agent tokens (keeps them inert in pretrain)
+            # agent tokens: all modalities in wm_agent_oneway, agent-only in wm_agent_isolated
             is_q_agent = (q_mod == int(Modality.AGENT))
             is_k_agent = (k_mod == int(Modality.AGENT))
 
@@ -348,8 +348,9 @@ class SpaceSelfAttentionModality(nn.Module):
             allow_non_agent_q = ~is_q_agent
             allow = torch.where(allow_non_agent_q, ~is_k_agent, allow)
 
-            # agent queries only see agent keys
-            allow = torch.where(is_q_agent, is_k_agent, allow)
+            if self.mode == "wm_agent_isolated":
+                # agent queries only see agent keys (keeps them inert in pretrain)
+                allow = torch.where(is_q_agent, is_k_agent, allow)
             return allow
 
         raise ValueError(f"Unsupported mode for tokenizer/wm: {self.mode}")
