@@ -20,6 +20,12 @@ class WMDataset(Dataset):
 
     If lists are provided, they are treated as paired roots. If one is length-1
     and the other is longer, the length-1 root is broadcast.
+
+    `extra_keys` names additional per-step columns to read from the demo `.pt`
+    (e.g. per-step annotations written alongside `action`/`reward`). Each must be
+    a tensor with one row per frame; it is sliced exactly like `reward`, so it
+    stays aligned with the transitions, and it is returned under its own name.
+    A requested key that a source is missing raises rather than being skipped.
     """
     def __init__(
         self,
@@ -35,6 +41,7 @@ class WMDataset(Dataset):
         tasks_json: str = "../tasks.json",
         tasks: Optional[list[str]] = None,
         strict_tasks: bool = True,
+        extra_keys: Optional[Sequence[str]] = None,
     ):
         super().__init__()
 
@@ -73,6 +80,7 @@ class WMDataset(Dataset):
         self.verbose = bool(verbose)
         self.tasks_filter = None if tasks is None else set(tasks)
         self.strict_tasks = bool(strict_tasks)
+        self.extra_keys = tuple(extra_keys or ())
 
         # --- Task metadata (action_dim + text_embedding) ---
         self.task_meta: Optional[dict] = None
@@ -132,6 +140,7 @@ class WMDataset(Dataset):
         self.ep = []
         self.act = []
         self.rew = []
+        self.extra = []        # per task -> {key: (N_eff,C) tensor}
         self.valid_starts = []
         self._cum_counts = []
 
@@ -147,6 +156,7 @@ class WMDataset(Dataset):
             seg_eps = []
             seg_acts = []
             seg_rews = []
+            seg_extra = {k: [] for k in self.extra_keys}
             seg_shards = []
             seg_num_frames = []
             seg_demo_paths = []
@@ -177,6 +187,21 @@ class WMDataset(Dataset):
                         print(f"[WMDataset] Skipping task={task} source=({dd},{fd}): missing keys in demo: {e}")
                     continue
 
+                extra_src = {}
+                for k in self.extra_keys:
+                    if k not in td:
+                        raise KeyError(
+                            f"extra key '{k}' not in {dp}; available: {sorted(td.keys())}"
+                        )
+                    v = td[k]
+                    if not torch.is_tensor(v):
+                        raise TypeError(f"extra key '{k}' in {dp} is {type(v).__name__}, not a tensor")
+                    if v.ndim == 1:
+                        v = v.unsqueeze(-1)
+                    if v.ndim != 2:
+                        raise ValueError(f"extra key '{k}' in {dp} has shape {tuple(v.shape)}, expected (N,) or (N,C)")
+                    extra_src[k] = v.cpu().to(torch.float32)
+
                 if rew.ndim == 2 and rew.shape[-1] == 1:
                     rew = rew.squeeze(-1)
                 rew = rew.to(torch.float32)
@@ -190,6 +215,11 @@ class WMDataset(Dataset):
                     if self.verbose:
                         print(f"[WMDataset] Skipping task={task} source=({dd},{fd}): length mismatch ep/act/rew.")
                     continue
+                for k, v in extra_src.items():
+                    if v.shape[0] != N:
+                        raise ValueError(
+                            f"extra key '{k}' in {dp} has {v.shape[0]} rows, expected {N}"
+                        )
 
                 # Determine frames available in this source segment (load only last shard)
                 try:
@@ -211,6 +241,8 @@ class WMDataset(Dataset):
                 ep = ep[:N_eff]
                 act = act[:N_eff]
                 rew = rew[:N_eff]
+                for k in extra_src:
+                    extra_src[k] = extra_src[k][:N_eff]
 
                 # Make episode IDs unique across segments to prevent windows crossing boundaries
                 if ep.numel() > 0:
@@ -223,6 +255,8 @@ class WMDataset(Dataset):
                 seg_eps.append(ep)
                 seg_acts.append(act)
                 seg_rews.append(rew)
+                for k, v in extra_src.items():
+                    seg_extra[k].append(v)
                 seg_shards.append(shards)
                 seg_num_frames.append(int(N_eff))
                 seg_demo_paths.append(dp)
@@ -236,6 +270,15 @@ class WMDataset(Dataset):
             ep = torch.cat(seg_eps, dim=0)
             act = torch.cat(seg_acts, dim=0)
             rew = torch.cat(seg_rews, dim=0)
+            extra_cat = {}
+            for k, vs in seg_extra.items():
+                widths = {int(v.shape[1]) for v in vs}
+                if len(widths) > 1:
+                    raise ValueError(
+                        f"extra key '{k}' has different column counts across sources for "
+                        f"task={task}: {sorted(widths)} — the columns would silently misalign"
+                    )
+                extra_cat[k] = torch.cat(vs, dim=0)
 
             N_eff = int(rew.shape[0])
             # --- END NEW segment gathering/concat ---
@@ -313,6 +356,7 @@ class WMDataset(Dataset):
             self.ep.append(ep)
             self.act.append(act)
             self.rew.append(rew)
+            self.extra.append(extra_cat)
             self.valid_starts.append(valid_idx)
 
             # precomputed metadata per task index
@@ -449,7 +493,7 @@ class WMDataset(Dataset):
 
         act_mask = self._act_mask_1d[task_idx][None, :].expand(self.T, self.A).contiguous()
 
-        return {
+        out = {
             "obs": obs,
             "act": act_padded,
             "act_mask": act_mask,
@@ -457,6 +501,11 @@ class WMDataset(Dataset):
             "lang_emb": self._lang_embs[task_idx],
             "emb_id": self._emb_ids[task_idx],
         }
+        # Sliced exactly like `rew`, so an extra column stays on the same transition it was
+        # stored against.
+        for k, v in self.extra[task_idx].items():
+            out[k] = v[start + 1 : start + 1 + self.T]
+        return out
 
 
 def collate_batch(batch):
