@@ -750,8 +750,26 @@ def train(args):
     ckpt_dir = Path(args.ckpt_dir)
     if args.resume is not None:
         step, start_epoch = load_ckpt(Path(args.resume), dyn_model=dyn, opt=opt, rms=rms)
+        # load_state_dict restores param_groups, so --lr from the command line is discarded here.
+        # Warmup is the only code that re-applies it and it is gated on step < warmup_steps, which
+        # a resume is past. Refuse rather than train at a learning rate nobody asked for.
+        ckpt_lr = float(opt.param_groups[0]["lr"])
+        if not math.isclose(ckpt_lr, args.lr, rel_tol=1e-9, abs_tol=0.0):
+            if not args.override_lr:
+                raise SystemExit(
+                    f"--lr {args.lr} disagrees with the optimizer state restored from "
+                    f"{args.resume} (lr={ckpt_lr}). torch restores param_groups on "
+                    f"load_state_dict, so --lr is ignored on resume. Pass --override_lr to "
+                    f"apply it, or pass --lr {ckpt_lr} to continue unchanged."
+                )
+            for pg in opt.param_groups:
+                pg["lr"] = args.lr
+        eff_lr = float(opt.param_groups[0]["lr"])
         if is_rank0():
-            print(f"[rank0] Resumed from {args.resume} (step={step}, epoch={start_epoch})")
+            print(
+                f"[rank0] Resumed from {args.resume} (step={step}, epoch={start_epoch}, "
+                f"ckpt_lr={ckpt_lr}, effective_lr={eff_lr})"
+            )
 
     # Training loop
     dyn.train()
@@ -1050,6 +1068,7 @@ if __name__ == "__main__":
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--warmup_steps", type=int, default=0)
+    p.add_argument("--override_lr", action="store_true")
 
     # collapse tripwire (debug/pred_spread is logged every log_every steps)
     p.add_argument("--collapse_check_after", type=int, default=1000)
