@@ -235,7 +235,7 @@ def dynamics_pretrain_loss(
     w_self = 0.9 * sigma_self + 0.1
 
     # Main forward
-    z1_hat_full, _ = dynamics(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=agent_tokens)
+    z1_hat_full, h_full = dynamics(actions, step_idx_full, sigma_idx_full, z_tilde_full, act_mask=act_mask_full, agent_tokens=agent_tokens)
     z1_hat_emp = z1_hat_full[:B_emp]
     z1_hat_self = z1_hat_full[B_emp:]
 
@@ -298,6 +298,11 @@ def dynamics_pretrain_loss(
         "loss_self": loss_self.detach(),
         "sigma_mean": sigma_full.mean().detach(),
         "pred_spread": pred_spread.detach(),
+        # Agent-token output of the main forward. Not detached: agent finetuning reads the heads
+        # off it and the video loss keeps running on the same pass, so a second forward would be
+        # pure waste. None when n_agent == 0.
+        "agent_h": h_full,
+        "n_empirical_rows": B_emp,
     }
     return loss, aux
 
