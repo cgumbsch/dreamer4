@@ -170,6 +170,42 @@ class EmaRms(nn.Module):
         return float(self.sq_ema.sqrt().item())
 
 
+class ParamEma:
+    """Exponential moving average of model parameters, kept alongside the live weights."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.num_updates = 0
+        self.shadow: Dict[str, torch.Tensor] = {
+            k: v.detach().clone().float()
+            for k, v in model.state_dict().items()
+            if v.is_floating_point()
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        self.num_updates += 1
+        # ramp in, so the average is not held back by the initial weights
+        d = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+        for k, v in model.state_dict().items():
+            s = self.shadow.get(k)
+            if s is not None:
+                s.mul_(d).add_(v.detach().float(), alpha=1.0 - d)
+
+    def state_dict(self, model: nn.Module) -> Dict[str, torch.Tensor]:
+        """Averaged floats plus the live non-float entries; loads with strict=True."""
+        out = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        for k, v in self.shadow.items():
+            out[k] = v.to(out[k].dtype)
+        return out
+
+    def load_state_dict(self, sd: Dict[str, torch.Tensor], num_updates: int = 0) -> None:
+        for k, s in self.shadow.items():
+            if k in sd:
+                s.copy_(sd[k].to(device=s.device, dtype=torch.float32))
+        self.num_updates = int(num_updates)
+
+
 class MAEReplacer(nn.Module):
     def __init__(self, d_model: int, p_min: float = 0.0, p_max: float = 0.9):
         super().__init__()

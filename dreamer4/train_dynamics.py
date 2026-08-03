@@ -21,6 +21,7 @@ from sharded_frame_dataset import ShardedFrameDataset
 from model import (
     Encoder, Decoder, Tokenizer,
     EmaRms,
+    ParamEma,
     temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial,
     unpack_spatial_to_bottleneck,
@@ -64,7 +65,7 @@ def init_distributed() -> tuple[bool, int, int, int]:
     return ddp, rank, world_size, local_rank
 
 
-def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, args: argparse.Namespace, rms=None):
+def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, args: argparse.Namespace, rms=None, ema=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     obj = {
         "step": step,
@@ -75,12 +76,16 @@ def save_ckpt(path: Path, *, step: int, epoch: int, dyn_model, opt, args: argpar
         "args": vars(args),
         "scale_pos_embeds": args.scale_pos_embeds,
     }
+    if ema is not None:
+        base = dyn_model.module if hasattr(dyn_model, "module") else dyn_model
+        obj["dynamics_ema"] = ema.state_dict(base)
+        obj["ema_updates"] = ema.num_updates
     tmp = path.with_suffix(".tmp")
     torch.save(obj, tmp)
     tmp.replace(path)
 
 
-def load_ckpt(path: Path, *, dyn_model, opt, rms=None) -> tuple[int, int]:
+def load_ckpt(path: Path, *, dyn_model, opt, rms=None, ema=None) -> tuple[int, int]:
     ckpt = torch.load(path, map_location="cpu")
     state = ckpt["dynamics"]
     (dyn_model.module if hasattr(dyn_model, "module") else dyn_model).load_state_dict(state, strict=True)
@@ -89,6 +94,8 @@ def load_ckpt(path: Path, *, dyn_model, opt, rms=None) -> tuple[int, int]:
         for k, v in rms.items():
             if k in ckpt["rms"]:
                 v.load_state_dict(ckpt["rms"][k])
+    if ema is not None and ckpt.get("dynamics_ema") is not None:
+        ema.load_state_dict(ckpt["dynamics_ema"], num_updates=int(ckpt.get("ema_updates", 0)))
     return int(ckpt.get("step", 0)), int(ckpt.get("epoch", 0))
 
 
@@ -734,6 +741,12 @@ def train(args):
 
     rms = {"flow": EmaRms().to(device), "boot": EmaRms().to(device)}
 
+    ema = None
+    if args.ema_decay > 0:
+        ema = ParamEma(dyn.module if hasattr(dyn, "module") else dyn, decay=args.ema_decay)
+        if is_rank0():
+            print(f"[ema] parameter EMA enabled, decay={args.ema_decay}")
+
     # Initialize wandb
     if is_rank0():
         wandb.init(
@@ -749,7 +762,7 @@ def train(args):
     start_epoch = 0
     ckpt_dir = Path(args.ckpt_dir)
     if args.resume is not None:
-        step, start_epoch = load_ckpt(Path(args.resume), dyn_model=dyn, opt=opt, rms=rms)
+        step, start_epoch = load_ckpt(Path(args.resume), dyn_model=dyn, opt=opt, rms=rms, ema=ema)
         if is_rank0():
             print(f"[rank0] Resumed from {args.resume} (step={step}, epoch={start_epoch})")
 
@@ -840,6 +853,9 @@ def train(args):
 
                     opt.step()
                     opt.zero_grad(set_to_none=True)
+
+                    if ema is not None:
+                        ema.update(dyn.module if hasattr(dyn, "module") else dyn)
 
                 # Evaluation / visualization
                 if is_rank0() and args.eval_every > 0 and (step % args.eval_every == 0):
@@ -958,9 +974,9 @@ def train(args):
                 # save on optimizer boundaries (compatible with grad_accum > 1)
                 if is_rank0() and args.save_every > 0 and do_step and (step % args.save_every) < grad_accum:
                     ckpt_path = ckpt_dir / f"step_{step:07d}.pt"
-                    save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms)
+                    save_ckpt(ckpt_path, step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms, ema=ema)
                     latest = ckpt_dir / "latest.pt"
-                    save_ckpt(latest, step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms)
+                    save_ckpt(latest, step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms, ema=ema)
 
                 step += 1
 
@@ -976,8 +992,8 @@ def train(args):
     # alignment, so latest.pt matches the exact step where training stopped.
     if is_rank0():
         final_ckpt = ckpt_dir / f"step_{step:07d}.pt"
-        save_ckpt(final_ckpt, step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms)
-        save_ckpt(ckpt_dir / "latest.pt", step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms)
+        save_ckpt(final_ckpt, step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms, ema=ema)
+        save_ckpt(ckpt_dir / "latest.pt", step=step, epoch=epoch, dyn_model=dyn, opt=opt, args=args, rms=rms, ema=ema)
 
     if ddp:
         dist.barrier()
@@ -1046,6 +1062,8 @@ if __name__ == "__main__":
     # optim
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
+    p.add_argument("--ema_decay", type=float, default=0.0,
+                   help="parameter EMA decay; 0 disables. Saved as `dynamics_ema`.")
     p.add_argument("--max_steps", type=int, default=10_000_000)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--grad_clip", type=float, default=1.0)
