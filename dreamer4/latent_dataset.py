@@ -98,10 +98,11 @@ class LatentWindowDataset(Dataset):
     def __getitem__(self, idx: int):
         self._open()
         i = int(idx)
+        # np.array copies: a memmap slice is read-only and torch.from_numpy warns on every item
         return {
-            "z": torch.from_numpy(np.asarray(self._lat[i])),
-            "act": torch.from_numpy(np.asarray(self._act[i])),
-            "act_mask": torch.from_numpy(np.asarray(self._mask[i])),
+            "z": torch.from_numpy(np.array(self._lat[i])),
+            "act": torch.from_numpy(np.array(self._act[i])),
+            "act_mask": torch.from_numpy(np.array(self._mask[i])),
             "emb_id": torch.tensor(int(self._emb[i]), dtype=torch.long),
         }
 
