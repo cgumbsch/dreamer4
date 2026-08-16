@@ -145,6 +145,45 @@ class RotaryEmbedding(nn.Module):
         return cos, sin
 
 
+class KVCache:
+    """Keys and values of the temporal attention, one buffer per layer.
+
+    Space attention is intra-frame and time attention is causal, so the activations of a frame
+    depend only on earlier frames and can be reused. Buffers are preallocated to `max_len` and
+    handed out as views; `fuse` writes the new positions at `length`, `advance` commits them.
+    Writes past `length` land in the unused tail, so a step may be recomputed before it is
+    committed.
+    """
+
+    def __init__(self, depth: int, max_len: int):
+        self.depth = int(depth)
+        self.max_len = int(max_len)
+        self.length = 0
+        self._k: list[Optional[torch.Tensor]] = [None] * self.depth
+        self._v: list[Optional[torch.Tensor]] = [None] * self.depth
+
+    def reset(self) -> None:
+        self.length = 0
+
+    def fuse(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        n, h, L, dh = k.shape
+        if self.length + L > self.max_len:
+            raise ValueError(f"kv cache overflow: {self.length} + {L} > {self.max_len}")
+        buf_k, buf_v = self._k[layer], self._v[layer]
+        if (buf_k is None or buf_k.shape[0] != n or buf_k.shape[1] != h
+                or buf_k.shape[3] != dh or buf_k.dtype != k.dtype or buf_k.device != k.device):
+            buf_k = k.new_zeros((n, h, self.max_len, dh))
+            buf_v = v.new_zeros((n, h, self.max_len, dh))
+            self._k[layer], self._v[layer] = buf_k, buf_v
+        t = self.length
+        buf_k[:, :, t:t + L] = k
+        buf_v[:, :, t:t + L] = v
+        return buf_k[:, :, :t + L], buf_v[:, :, :t + L]
+
+    def advance(self, n: int) -> None:
+        self.length += int(n)
+
+
 class EmaRms(nn.Module):
     """
     Running root-mean-square normalizer using exponential moving average (EMA).
@@ -251,10 +290,14 @@ class MultiheadSelfAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim) if qk_norm else None
         self.rope = RotaryEmbedding(self.head_dim) if rope else None
 
-    def forward(self, x_nld: torch.Tensor, *, attn_mask: Optional[torch.Tensor] = None, is_causal: bool = False):
+    def forward(self, x_nld: torch.Tensor, *, attn_mask: Optional[torch.Tensor] = None,
+                is_causal: bool = False, cache: Optional[KVCache] = None,
+                cache_layer: int = 0, pos_offset: int = 0):
         """
         x: (N,L,D)
         attn_mask: bool, True means "allowed to attend" (for torch SDPA), broadcastable to (N,1,L,L) or (N,H,L,L)
+        cache: keys/values of earlier positions; the L given here are appended after them
+        pos_offset: absolute position of the first of the L given positions (rotary only)
         """
         N, L, D = x_nld.shape
         q, k, v = self.qkv(x_nld).chunk(3, dim=-1)
@@ -270,9 +313,22 @@ class MultiheadSelfAttention(nn.Module):
         # rotary last: a per-dim norm applied after it would not commute with the rotation,
         # which is what makes the logits depend on relative position only
         if self.rope is not None:
-            cos, sin = self.rope.get_cos_sin(L, device=x_nld.device, dtype=q.dtype)
+            cos, sin = self.rope.get_cos_sin(L, device=x_nld.device, dtype=q.dtype,
+                                             offset=pos_offset)
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
+
+        if cache is not None:
+            prefix = cache.length
+            k, v = cache.fuse(cache_layer, k, v)
+            if prefix > 0:
+                # the L queries are the suffix, so every cached key precedes all of them
+                if is_causal and L > 1:
+                    allow = torch.ones((L, prefix + L), dtype=torch.bool, device=x_nld.device)
+                    allow[:, prefix:] = torch.ones((L, L), dtype=torch.bool,
+                                                   device=x_nld.device).tril()
+                    attn_mask = allow[None, None]
+                is_causal = False
 
         drop = self.dropout_p if self.training else 0.0
         if self.attn_softcap > 0.0:
@@ -372,9 +428,12 @@ class TimeSelfAttention(nn.Module):
         self.attn = MultiheadSelfAttention(d_model, n_heads, dropout=dropout,
                                            qk_norm=qk_norm, attn_softcap=attn_softcap, rope=rope)
 
-    def forward(self, x_btSd: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_btSd: torch.Tensor, *, cache: Optional[KVCache] = None,
+                cache_layer: int = 0, pos_offset: int = 0) -> torch.Tensor:
         B, T, S, D = x_btSd.shape
         if self.latents_only:
+            if cache is not None:
+                raise ValueError("kv cache is not supported with latents_only time attention")
             L = self.n_latents
             lat = x_btSd[:, :, :L, :]  # (B,T,L,D)
             lat_nld = lat.permute(0, 2, 1, 3).contiguous().view(B * L, T, D)
@@ -385,7 +444,8 @@ class TimeSelfAttention(nn.Module):
             return x
         else:
             x_nld = x_btSd.permute(0, 2, 1, 3).contiguous().view(B * S, T, D)
-            out = self.attn(x_nld, is_causal=True)
+            out = self.attn(x_nld, is_causal=True, cache=cache, cache_layer=cache_layer,
+                            pos_offset=pos_offset)
             return out.view(B, S, T, D).permute(0, 2, 1, 3).contiguous()
 
 
@@ -408,6 +468,7 @@ class BlockCausalLayer(nn.Module):
     ):
         super().__init__()
         self.do_time = ((layer_index + 1) % time_every == 0)
+        self.layer_index = int(layer_index)
 
         self.norm1 = RMSNorm(d_model)
         self.space = SpaceSelfAttentionModality(d_model, n_heads, modality_ids, n_latents, space_mode, dropout,
@@ -423,10 +484,12 @@ class BlockCausalLayer(nn.Module):
         self.norm3 = RMSNorm(d_model)
         self.mlp = MLP(d_model, mlp_ratio=mlp_ratio, dropout=dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, cache: Optional[KVCache] = None,
+                pos_offset: int = 0) -> torch.Tensor:
         x = x + self.drop1(self.space(self.norm1(x)))
         if self.do_time:
-            x = x + self.drop2(self.time(self.norm2(x)))
+            x = x + self.drop2(self.time(self.norm2(x), cache=cache,
+                                         cache_layer=self.layer_index, pos_offset=pos_offset))
         x = x + self.mlp(self.norm3(x))
         return x
 
@@ -461,9 +524,12 @@ class BlockCausalTransformer(nn.Module):
             for i in range(depth)
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, cache: Optional[KVCache] = None,
+                cache_advance: bool = False, pos_offset: int = 0) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, cache=cache, pos_offset=pos_offset)
+        if cache is not None and cache_advance:
+            cache.advance(x.shape[1])
         return x
 
 
@@ -791,6 +857,9 @@ class Dynamics(nn.Module):
         nn.init.zeros_(self.flow_x_head.weight)
         nn.init.zeros_(self.flow_x_head.bias)
 
+    def make_cache(self, max_len: int) -> KVCache:
+        return KVCache(depth=len(self.transformer.layers), max_len=max_len)
+
     def forward(
         self,
         actions: Optional[torch.Tensor],          # (B,T,16) or None
@@ -800,6 +869,9 @@ class Dynamics(nn.Module):
         *,
         act_mask: Optional[torch.Tensor] = None,  # (B,T,16) or (16,) or None
         agent_tokens: Optional[torch.Tensor] = None,
+        cache: Optional[KVCache] = None,
+        cache_advance: bool = False,
+        t_offset: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T = packed_enc_tokens.shape[:2]
 
@@ -825,12 +897,15 @@ class Dynamics(nn.Module):
             toks = [action_tokens, sig_tok, step_tok, spatial_tokens, reg]
 
         tokens = torch.cat(toks, dim=2)  # (B,T,S,D)
-        t_offset = 0
-        if self.training and self.pos_offset_max > 0:
-            t_offset = int(torch.randint(0, self.pos_offset_max + 1, (1,)).item())
+        if t_offset is None:
+            t_offset = 0
+            if self.training and self.pos_offset_max > 0:
+                t_offset = int(torch.randint(0, self.pos_offset_max + 1, (1,)).item())
+        t_offset = int(t_offset)
         tokens = add_sinusoidal_positions(tokens, self.scale_pos_embeds, t_offset,
                                           add_time=not self.rope)
-        x = self.transformer(tokens)
+        x = self.transformer(tokens, cache=cache, cache_advance=cache_advance,
+                             pos_offset=t_offset)
 
         spatial_out = x[:, :, self.spatial_slice, :]
         x1_hat = self.flow_x_head(spatial_out)  # (B,T,n_spatial,d_spatial)
