@@ -399,6 +399,96 @@ def sample_one_timestep_packed(
 
 
 @torch.no_grad()
+def write_frames_to_cache(
+    dyn: Dynamics,
+    *,
+    cache,
+    z_packed: torch.Tensor,                     # (B,n,n_spatial,d_spatial)
+    t_offset: int,
+    k_max: int,
+    actions: Optional[torch.Tensor] = None,     # (B,n,A) or None
+    act_mask: Optional[torch.Tensor] = None,    # (B,n,A) or None
+) -> Optional[torch.Tensor]:
+    """Commit `n` finalized frames to the cache at the conditioning the sampler gives context.
+
+    Returns the agent tokens of those frames, so the pass that writes the cache is also the one
+    that reads `h`.
+    """
+    device = z_packed.device
+    B, n = z_packed.shape[:2]
+    emax = int(round(math.log2(k_max)))
+    step_idxs = torch.full((B, n), emax, device=device, dtype=torch.long)
+    signal_idxs = torch.full((B, n), k_max - 1, device=device, dtype=torch.long)
+    _, h = dyn(
+        actions,
+        step_idxs,
+        signal_idxs,
+        z_packed,
+        act_mask=act_mask,
+        agent_tokens=None,
+        cache=cache,
+        cache_advance=True,
+        t_offset=t_offset,
+    )
+    return h
+
+
+@torch.no_grad()
+def sample_one_timestep_cached(
+    dyn: Dynamics,
+    *,
+    cache,
+    t: int,
+    k_max: int,
+    sched: Dict[str, Any],
+    n_spatial: int,
+    d_spatial: int,
+    batch: int,
+    device,
+    dtype,
+    action: Optional[torch.Tensor] = None,      # (B,1,A) or None
+    act_mask: Optional[torch.Tensor] = None,    # (B,1,A) or None
+) -> torch.Tensor:
+    """One integration of the flow at position `t`, reading the prefix from `cache`.
+
+    The cache is not advanced: each integration step re-runs the same position. Same computation
+    as `sample_one_timestep_packed`, without recomputing the prefix.
+    """
+    K = int(sched["K"])
+    e = int(sched["e"])
+    tau = sched["tau"]
+    tau_idx = sched["tau_idx"]
+    dt = float(sched["dt"])
+
+    z = torch.randn((batch, 1, n_spatial, d_spatial), device=device, dtype=dtype)
+
+    step_idxs = torch.full((batch, 1), e, device=device, dtype=torch.long)
+    signal_idxs = torch.zeros((batch, 1), device=device, dtype=torch.long)
+
+    for i in range(K):
+        tau_i = float(tau[i])
+        signal_idxs.fill_(int(tau_idx[i]))
+
+        x1_hat, _ = dyn(
+            action,
+            step_idxs,
+            signal_idxs,
+            z,
+            act_mask=act_mask,
+            agent_tokens=None,
+            cache=cache,
+            cache_advance=False,
+            t_offset=t,
+        )
+
+        denom = max(1e-4, 1.0 - tau_i)
+        b = (x1_hat.float() - z.float()) / denom
+        z = (z.float() + b * dt).to(dtype)
+
+    return z[:, 0]
+
+
+@torch.no_grad()
 def sample_autoregressive_packed_sequence(
     dyn: Dynamics,
     *,
@@ -409,11 +499,27 @@ def sample_autoregressive_packed_sequence(
     sched: Dict[str, Any],
     actions: Optional[torch.Tensor] = None,     # (B,T,A) or None
     act_mask: Optional[torch.Tensor] = None,    # (B,T,A) or (A,) or None
+    use_cache: bool = False,
 ) -> torch.Tensor:
     B, T = z_gt_packed.shape[:2]
     L = min(T, ctx_length + horizon)
     ctx_length = min(ctx_length, L - 1)
     horizon = min(horizon, L - ctx_length)
+
+    if act_mask is not None and act_mask.dim() == 1:
+        act_mask = act_mask.view(1, 1, -1)
+
+    if use_cache:
+        return _sample_autoregressive_cached(
+            dyn,
+            z_gt_packed=z_gt_packed,
+            ctx_length=ctx_length,
+            horizon=horizon,
+            k_max=k_max,
+            sched=sched,
+            actions=actions,
+            act_mask=act_mask,
+        )
 
     outs = [z_gt_packed[:, t] for t in range(ctx_length)]
 
@@ -428,6 +534,69 @@ def sample_autoregressive_packed_sequence(
             act_mask=act_mask,
         )
         outs.append(z_next)
+
+    return torch.stack(outs, dim=1)
+
+
+@torch.no_grad()
+def _sample_autoregressive_cached(
+    dyn: Dynamics,
+    *,
+    z_gt_packed: torch.Tensor,
+    ctx_length: int,
+    horizon: int,
+    k_max: int,
+    sched: Dict[str, Any],
+    actions: Optional[torch.Tensor],
+    act_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    B = z_gt_packed.shape[0]
+    n_spatial, d_spatial = z_gt_packed.shape[2], z_gt_packed.shape[3]
+    device, dtype = z_gt_packed.device, z_gt_packed.dtype
+
+    def slot(x, a, b):
+        if x is None:
+            return None
+        return x[:, a:b] if x.shape[1] > 1 else x
+
+    cache = dyn.make_cache(ctx_length + horizon)
+    write_frames_to_cache(
+        dyn,
+        cache=cache,
+        z_packed=z_gt_packed[:, :ctx_length],
+        t_offset=0,
+        k_max=k_max,
+        actions=slot(actions, 0, ctx_length),
+        act_mask=slot(act_mask, 0, ctx_length),
+    )
+
+    outs = [z_gt_packed[:, t] for t in range(ctx_length)]
+
+    for t in range(ctx_length, ctx_length + horizon):
+        z_next = sample_one_timestep_cached(
+            dyn,
+            cache=cache,
+            t=t,
+            k_max=k_max,
+            sched=sched,
+            n_spatial=n_spatial,
+            d_spatial=d_spatial,
+            batch=B,
+            device=device,
+            dtype=dtype,
+            action=slot(actions, t, t + 1),
+            act_mask=slot(act_mask, t, t + 1),
+        )
+        outs.append(z_next)
+        write_frames_to_cache(
+            dyn,
+            cache=cache,
+            z_packed=z_next.unsqueeze(1),
+            t_offset=t,
+            k_max=k_max,
+            actions=slot(actions, t, t + 1),
+            act_mask=slot(act_mask, t, t + 1),
+        )
 
     return torch.stack(outs, dim=1)
 
