@@ -4,6 +4,7 @@ import time
 import math
 import random
 import argparse
+import hashlib
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -17,6 +18,7 @@ import wandb
 
 from task_set import TASK_SET
 from sharded_frame_dataset import ShardedFrameDataset
+from latent_dataset import LatentWindowDataset, collate_latent_batch
 
 from model import (
     Encoder, Decoder, Tokenizer,
@@ -158,6 +160,14 @@ def load_frozen_tokenizer_from_pt_ckpt(
         p.requires_grad_(False)
 
     return tok.encoder, tok.decoder, tok_args
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _emax_from_kmax(k_max: int) -> int:
@@ -623,7 +633,36 @@ def train(args):
 
     # Dataset and DataLoader
     tasks = args.tasks if args.tasks else TASK_SET
-    if args.use_actions:
+    use_latents = args.latent_cache is not None
+    if use_latents:
+        if args.eval_every > 0:
+            raise ValueError(
+                "--latent_cache carries no frames, so the in-training rollout eval cannot run. "
+                "Pass --eval_every 0."
+            )
+        if not args.use_actions:
+            raise ValueError("--latent_cache stores actions; run it with --use_actions")
+        dataset = LatentWindowDataset(
+            args.latent_cache,
+            seq_len=args.seq_len,
+            action_dim=16,
+            tokenizer_sha=sha256_file(args.tokenizer_ckpt),
+            verbose=is_rank0(),
+        )
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if ddp else None
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            shuffle=(sampler is None),
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=(args.num_workers > 0),
+            worker_init_fn=worker_init_fn,
+            collate_fn=collate_latent_batch,
+        )
+    elif args.use_actions:
         from wm_dataset import WMDataset, collate_batch
         dataset = WMDataset(
             data_dir=args.data_dirs,
@@ -773,7 +812,19 @@ def train(args):
                 if step >= args.max_steps:
                     break
 
-                if args.use_actions:
+                if use_latents:
+                    z_btLd = batch["z"].to(device, non_blocking=True)            # (B,T,L,D_b)
+                    act    = batch["act"].to(device, non_blocking=True)
+                    mask   = batch["act_mask"].to(device, non_blocking=True)
+
+                    act = act.clamp(-1, 1) * mask
+
+                    frames = None
+                    actions = torch.zeros_like(act)
+                    actions[:, 1:] = act[:, :-1]
+                    act_mask = torch.zeros_like(mask)
+                    act_mask[:, 1:] = mask[:, :-1]
+                elif args.use_actions:
                     obs_u8 = batch["obs"].to(device, non_blocking=True)          # (B,T+1,3,H,W) uint8
                     act    = batch["act"].to(device, non_blocking=True)          # (B,T,16) float
                     mask   = batch["act_mask"].to(device, non_blocking=True)     # (B,T,16) float (optional but good)
@@ -792,14 +843,17 @@ def train(args):
                     act_mask = None
 
                 # Safeguard: convert to [0, 1] if dataset returns uint8
-                if frames.dtype == torch.uint8:
+                if frames is not None and frames.dtype == torch.uint8:
                     frames = frames.float() / 255.0
 
-                # Frozen encoder -> packed spatial tokens z1
-                with torch.no_grad():
-                    patches = temporal_patchify(frames, patch)  # (B,T,Np,Dp)
-                    z_btLd, _ = encoder(patches)                # (B,T,n_latents,d_b)
-                    z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=args.packing_factor)  # (B,T,Sz,Dz)
+                if use_latents:
+                    z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=args.packing_factor)
+                else:
+                    # Frozen encoder -> packed spatial tokens z1
+                    with torch.no_grad():
+                        patches = temporal_patchify(frames, patch)  # (B,T,Np,Dp)
+                        z_btLd, _ = encoder(patches)                # (B,T,n_latents,d_b)
+                        z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=args.packing_factor)  # (B,T,Sz,Dz)
 
                 if actions is not None:
                     actions = actions.to(device, non_blocking=True)
@@ -1048,6 +1102,10 @@ if __name__ == "__main__":
 
     # actions
     p.add_argument("--use_actions", action="store_true")
+
+    # precomputed tokenizer latents (skips the frozen encoder in the training loop)
+    p.add_argument("--latent_cache", type=str, default=None,
+                   help="directory written by the latent cache builder; requires --eval_every 0")
 
     # optim
     p.add_argument("--lr", type=float, default=1e-4)
